@@ -151,6 +151,38 @@ SQLite tables:
 - `detections` — YOLO detections per sampled frame
 - `object_tracks` — de-duplicated unique object tracks across frames/chunks
 
+You can delete `data/native_camera/` entirely when you want a clean slate:
+
+```bash
+rm -rf /Users/shailendrasingh/PersonalDev/aicam/data/native_camera
+```
+
+The next `./run_native_camera.sh`, `python native_camera_pipeline.py run ...`,
+or `python native_camera_pipeline.py status` will recreate:
+
+```text
+data/native_camera/
+data/native_camera/clips/
+data/native_camera/frames/
+data/native_camera/audits/
+data/native_camera/native_camera.db
+```
+
+If `data/native_camera/` already exists, the script appends new clips and DB
+rows instead of resetting anything.
+
+Quick setup check:
+
+```bash
+python native_camera_pipeline.py doctor
+```
+
+Advanced: to test with a separate scratch data folder:
+
+```bash
+AICAM_NATIVE_DATA=/tmp/aicam-test python native_camera_pipeline.py doctor
+```
+
 ## Object classes counted
 
 The tracker currently counts:

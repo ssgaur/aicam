@@ -29,7 +29,7 @@ from ultralytics import YOLO
 
 
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data" / "native_camera"
+DATA = Path(os.getenv("AICAM_NATIVE_DATA", str(ROOT / "data" / "native_camera"))).expanduser()
 CLIPS = DATA / "clips"
 FRAMES = DATA / "frames"
 AUDITS = DATA / "audits"
@@ -1081,6 +1081,27 @@ def reset_db() -> None:
     print(f"db={DB_PATH}")
 
 
+def doctor() -> None:
+    init_db()
+    print("Native Camera Pipeline Doctor")
+    print(f"repo={ROOT}")
+    print(f"data_dir={DATA}")
+    print(f"clips_dir={CLIPS}")
+    print(f"frames_dir={FRAMES}")
+    print(f"audits_dir={AUDITS}")
+    print(f"db={DB_PATH}")
+    print(f"db_exists={DB_PATH.exists()}")
+    print(f"yolo_model={YOLO_MODEL}")
+    print(f"yolo_model_exists={YOLO_MODEL.exists()}")
+    try:
+        device_ready()
+        print("adb_device=ok")
+    except Exception as exc:
+        print(f"adb_device=error: {exc}")
+    print(f"mp4_count={len(list(CLIPS.glob('*.mp4'))) if CLIPS.exists() else 0}")
+    print(f"jpg_count={len(list(FRAMES.rglob('*.jpg'))) if FRAMES.exists() else 0}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Native Android Camera 10-second chunk object counter.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1102,6 +1123,7 @@ def main() -> int:
     status = sub.add_parser("status", help="Print latest chunk status")
     status.add_argument("--json", action="store_true", dest="json_status")
     sub.add_parser("wizard", help="Interactive prompt for clip count/duration, then run")
+    sub.add_parser("doctor", help="Verify data folders, DB, YOLO model, and connected Android device")
     sub.add_parser("reset-db", help="Backup and reset native camera SQLite DB")
 
     args = parser.parse_args()
@@ -1113,6 +1135,8 @@ def main() -> int:
     elif args.cmd == "status":
         init_db()
         print_status(json_mode=args.json_status)
+    elif args.cmd == "doctor":
+        doctor()
     elif args.cmd == "reset-db":
         reset_db()
     return 0
