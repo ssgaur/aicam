@@ -1,0 +1,266 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+const kDefaultBackend = 'http://192.168.1.56:8100';
+
+late List<CameraDescription> _cameras;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    _cameras = await availableCameras();
+  } catch (_) {
+    _cameras = [];
+  }
+  runApp(const AiCamApp());
+}
+
+class AiCamApp extends StatelessWidget {
+  const AiCamApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'AiCam',
+      theme: ThemeData(colorSchemeSeed: Colors.deepPurple, useMaterial3: true, brightness: Brightness.dark),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  final TextEditingController _backendCtl = TextEditingController(text: kDefaultBackend);
+  CameraController? _cam;
+  bool _camReady = false;
+  bool? _pingOk;
+  bool _streaming = false;
+  WebSocketChannel? _ws;
+  Uint8List? _overlay;
+  int _fps = 0;
+  int _framesSent = 0;
+  int _framesRecv = 0;
+  DateTime _lastSec = DateTime.now();
+  int _recvInLastSec = 0;
+  bool _busy = false;
+  String _status = '';
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    if (_cameras.isEmpty) {
+      setState(() => _status = 'No camera found');
+      return;
+    }
+    final back = _cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.back,
+      orElse: () => _cameras.first,
+    );
+    final c = CameraController(back, ResolutionPreset.medium, enableAudio: false, imageFormatGroup: ImageFormatGroup.jpeg);
+    await c.initialize();
+    if (!mounted) return;
+    setState(() {
+      _cam = c;
+      _camReady = true;
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stopStream();
+    _cam?.dispose();
+    _backendCtl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _testBackend() async {
+    setState(() => _busy = true);
+    try {
+      final r = await http.get(Uri.parse('${_backendCtl.text}/healthz')).timeout(const Duration(seconds: 4));
+      setState(() => _pingOk = r.statusCode == 200);
+    } catch (_) {
+      setState(() => _pingOk = false);
+    } finally {
+      setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _toggleStream() async {
+    if (_streaming) {
+      await _stopStream();
+    } else {
+      await _startStream();
+    }
+  }
+
+  Future<void> _startStream() async {
+    if (!_camReady) return;
+    final url = '${_backendCtl.text.replaceFirst('http', 'ws')}/ws/segment';
+    try {
+      _ws = WebSocketChannel.connect(Uri.parse(url));
+      _ws!.stream.listen(_onMessage, onError: (_) => _stopStream(), onDone: _stopStream);
+    } catch (e) {
+      setState(() => _status = 'WS error: $e');
+      return;
+    }
+    setState(() {
+      _streaming = true;
+      _status = 'streaming';
+      _framesSent = 0;
+      _framesRecv = 0;
+    });
+    _loopSendFrames();
+  }
+
+  Future<void> _stopStream() async {
+    final ws = _ws;
+    _ws = null;
+    try {
+      await ws?.sink.close();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _streaming = false;
+        _status = 'stopped';
+      });
+    }
+  }
+
+  Future<void> _loopSendFrames() async {
+    while (_streaming && _ws != null && _cam != null) {
+      try {
+        final pic = await _cam!.takePicture();
+        final bytes = await pic.readAsBytes();
+        if (!_streaming) break;
+        _ws!.sink.add(bytes);
+        _framesSent++;
+      } catch (e) {
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+      // Throttle to ~5 FPS max
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+  }
+
+  void _onMessage(dynamic msg) {
+    Uint8List? bytes;
+    if (msg is List<int>) {
+      bytes = Uint8List.fromList(msg);
+    } else if (msg is String) {
+      try {
+        final m = jsonDecode(msg) as Map<String, dynamic>;
+        if (m['png_b64'] is String) {
+          bytes = base64Decode(m['png_b64']);
+        }
+      } catch (_) {}
+    }
+    if (bytes == null) return;
+    _framesRecv++;
+    _recvInLastSec++;
+    final now = DateTime.now();
+    if (now.difference(_lastSec).inMilliseconds >= 1000) {
+      _fps = _recvInLastSec;
+      _recvInLastSec = 0;
+      _lastSec = now;
+    }
+    if (mounted) setState(() => _overlay = bytes);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pingIcon = _pingOk == null
+        ? const Icon(Icons.cloud_queue, color: Colors.grey)
+        : (_pingOk! ? const Icon(Icons.check_circle, color: Colors.green) : const Icon(Icons.cancel, color: Colors.red));
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('AiCam — SAM 2 Live'),
+        actions: [
+          Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Center(child: pingIcon)),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _backendCtl,
+                    decoration: const InputDecoration(labelText: 'Backend', isDense: true, border: OutlineInputBorder()),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonal(
+                  onPressed: _busy ? null : _testBackend,
+                  child: const Text('Test'),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _camReady
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CameraPreview(_cam!),
+                      if (_overlay != null)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: Opacity(
+                              opacity: 0.55,
+                              child: Image.memory(_overlay!, fit: BoxFit.cover, gaplessPlayback: true),
+                            ),
+                          ),
+                        ),
+                      Positioned(
+                        left: 8,
+                        top: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          color: Colors.black54,
+                          child: Text(
+                            'sent:$_framesSent  recv:$_framesRecv  ${_fps}fps  $_status',
+                            style: const TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+                : Center(child: Text(_status.isEmpty ? 'Initializing camera…' : _status)),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(12),
+            child: SizedBox(
+              width: double.infinity,
+              height: 56,
+              child: FilledButton.icon(
+                onPressed: _camReady ? _toggleStream : null,
+                icon: Icon(_streaming ? Icons.stop : Icons.play_arrow),
+                label: Text(_streaming ? 'Stop' : 'Start Live Segmentation'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: _streaming ? Colors.red : null,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
