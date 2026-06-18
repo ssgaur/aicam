@@ -29,8 +29,19 @@ SNAPS.mkdir(parents=True, exist_ok=True)
 CAPTION_EVERY_SEC = 3.0  # ~$2-3/day at 1 FPS, well under $10
 SAM_MAX_SIDE = 320
 YOLO_CONF = 0.35
+ROTATE_DEG = int(os.getenv("ROTATE_DEG", "-90"))   # -90 = clockwise 90°, 90 = CCW, 180 = flip
+PROCESS_EVERY_SEC = float(os.getenv("PROCESS_EVERY_SEC", "1.0"))  # heavy pipeline cadence
 
-_state = {"sam": None, "yolo": None, "device": None, "last_caption_ts": 0.0, "caption_inflight": False}
+_state = {"sam": None, "yolo": None, "device": None,
+          "last_caption_ts": 0.0, "caption_inflight": False,
+          "last_process_ts": 0.0, "process_inflight": False}
+
+# 1x1 transparent PNG for "no overlay" replies to phone
+_EMPTY_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01"
+    b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+)
 
 
 def _device() -> str:
@@ -209,44 +220,62 @@ def _save_frame(ts: float, img: Image.Image, dets: list, caption: str | None):
     con.commit(); con.close()
 
 
-async def _process_frame(jpeg: bytes) -> bytes:
-    """Heavy processing in a thread; returns SAM overlay PNG to send to phone."""
-    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+def _heavy_process(img: Image.Image):
+    """Synchronous SAM2 + YOLO + caption-save pipeline. Runs in a thread."""
     w, h = img.size
+    small = img.copy()
+    scale = SAM_MAX_SIDE / max(w, h)
+    if scale < 1.0:
+        small = small.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
+    arr_small = np.array(small)
+    overlay_png = _segment_overlay(arr_small, w, h)  # not used by phone; for future composite
+    dets = _yolo_detect(img)
+    return overlay_png, dets
 
-    def cpu_work():
-        small = img.copy()
-        scale = SAM_MAX_SIDE / max(w, h)
-        if scale < 1.0:
-            small = small.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-        arr_small = np.array(small)
-        overlay = _segment_overlay(arr_small, w, h)
-        dets = _yolo_detect(img)
-        return overlay, dets
 
-    overlay, dets = await asyncio.to_thread(cpu_work)
-    ts = time.time()
+async def _process_frame(jpeg: bytes) -> bytes:
+    """FAST path: rotate -> save raw to data/live.jpg -> kick off heavy pipeline async -> return tiny PNG.
 
-    # Schedule caption every CAPTION_EVERY_SEC, non-blocking
-    caption = None
-    if (not _state["caption_inflight"]) and (ts - _state["last_caption_ts"] >= CAPTION_EVERY_SEC):
-        _state["last_caption_ts"] = ts
-        _state["caption_inflight"] = True
-        async def _do_caption(img_for_cap):
+    Heavy SAM+YOLO+caption runs at most once per PROCESS_EVERY_SEC.
+    """
+    try:
+        img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+        if ROTATE_DEG:
+            img = img.rotate(ROTATE_DEG, expand=True)
+        # write live preview immediately (fast — no processing)
+        img.save(DATA / "live.jpg", "JPEG", quality=70)
+    except Exception as e:
+        print(f"[fast] {e}")
+        return _EMPTY_PNG
+
+    now = time.time()
+    if (not _state["process_inflight"]) and (now - _state["last_process_ts"] >= PROCESS_EVERY_SEC):
+        _state["last_process_ts"] = now
+        _state["process_inflight"] = True
+
+        async def _bg(img_for_proc):
             try:
-                cap = await _caption_async(img_for_cap)
-                if cap:
-                    annotated = _annotate(img_for_cap, dets, cap)
-                    _save_frame(time.time(), annotated, dets, cap)
+                overlay, dets = await asyncio.to_thread(_heavy_process, img_for_proc)
+                ts = time.time()
+                # caption logic
+                caption = None
+                if (not _state["caption_inflight"]) and (ts - _state["last_caption_ts"] >= CAPTION_EVERY_SEC):
+                    _state["last_caption_ts"] = ts
+                    _state["caption_inflight"] = True
+                    try:
+                        caption = await _caption_async(img_for_proc)
+                    finally:
+                        _state["caption_inflight"] = False
+                annotated = _annotate(img_for_proc, dets, caption)
+                _save_frame(time.time(), annotated, dets, caption)
+            except Exception as e:
+                print(f"[bg] {e}")
             finally:
-                _state["caption_inflight"] = False
-        asyncio.create_task(_do_caption(img))
-    else:
-        # save annotated even without caption (so we never lose a frame)
-        annotated = _annotate(img, dets, None)
-        _save_frame(ts, annotated, dets, None)
+                _state["process_inflight"] = False
 
-    return overlay
+        asyncio.create_task(_bg(img))
+
+    return _EMPTY_PNG  # phone discards / draws transparently
 
 
 @app.websocket("/ws/segment")
@@ -421,27 +450,36 @@ def api_say_pending(since: int = 0):
 
 @app.get("/stream")
 def stream():
-    """MJPEG stream of latest annotated frame; ~1 FPS."""
+    """High-FPS MJPEG of raw rotated camera frames (data/live.jpg)."""
+    return _mjpeg_stream(DATA / "live.jpg")
+
+
+@app.get("/stream/annotated")
+def stream_annotated():
+    """1 FPS MJPEG of YOLO+caption-annotated frames (data/latest.jpg)."""
+    return _mjpeg_stream(DATA / "latest.jpg")
+
+
+def _mjpeg_stream(path: Path):
     from fastapi.responses import StreamingResponse
 
     boundary = "frame"
 
     async def gen():
         last_mtime = 0.0
-        latest = DATA / "latest.jpg"
         while True:
             try:
-                if latest.exists():
-                    mt = latest.stat().st_mtime
+                if path.exists():
+                    mt = path.stat().st_mtime
                     if mt != last_mtime:
                         last_mtime = mt
-                        b = latest.read_bytes()
+                        b = path.read_bytes()
                         yield (
                             f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(b)}\r\n\r\n"
                         ).encode() + b + b"\r\n"
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.05)  # poll fast for live stream
 
     return StreamingResponse(gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
 
@@ -478,12 +516,16 @@ def view_page():
   <div class=top>
     <h1>AiCam — Live</h1>
     <div class=row>
+      <select id=streamSel>
+        <option value="/stream">Live (raw)</option>
+        <option value="/stream/annotated">Annotated (1 FPS)</option>
+      </select>
       <span id=device class=pill>—</span>
       <span id=fps class=pill>0 fps</span>
     </div>
   </div>
   <div class=main>
-    <div class=video><img src="/stream" alt="live"/></div>
+    <div class=video><img id=stream src="/stream" alt="live"/></div>
     <div class=side>
       <div class=card>
         <h2>Latest caption</h2>
@@ -508,9 +550,10 @@ def view_page():
 </div>
 <script>
 let lastFrameTs=0,frames=0;
-const img=document.querySelector('.video img');
+const img=document.getElementById('stream');
 img.addEventListener('load',()=>{frames++});
 setInterval(()=>{document.getElementById('fps').textContent=frames+' fps';frames=0},1000);
+document.getElementById('streamSel').addEventListener('change',e=>{img.src=e.target.value+'?'+Date.now()});
 
 async function refresh(){
   try{
