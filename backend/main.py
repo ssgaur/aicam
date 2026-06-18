@@ -419,6 +419,135 @@ def api_say_pending(since: int = 0):
     return [{"id": r[0], "ts": r[1], "text": r[2]} for r in rows]
 
 
+@app.get("/stream")
+def stream():
+    """MJPEG stream of latest annotated frame; ~1 FPS."""
+    from fastapi.responses import StreamingResponse
+
+    boundary = "frame"
+
+    async def gen():
+        last_mtime = 0.0
+        latest = DATA / "latest.jpg"
+        while True:
+            try:
+                if latest.exists():
+                    mt = latest.stat().st_mtime
+                    if mt != last_mtime:
+                        last_mtime = mt
+                        b = latest.read_bytes()
+                        yield (
+                            f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(b)}\r\n\r\n"
+                        ).encode() + b + b"\r\n"
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(gen(), media_type=f"multipart/x-mixed-replace; boundary={boundary}")
+
+
+@app.get("/view")
+def view_page():
+    from fastapi.responses import HTMLResponse
+
+    html = """<!doctype html>
+<html><head><meta charset=utf-8><title>AiCam Live</title>
+<style>
+  body{margin:0;background:#111;color:#eee;font-family:-apple-system,Segoe UI,sans-serif}
+  .wrap{display:flex;flex-direction:column;height:100vh}
+  .top{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:#000}
+  .top h1{margin:0;font-size:16px;font-weight:500}
+  .pill{padding:3px 10px;border-radius:10px;background:#222;font-size:12px}
+  .main{flex:1;display:grid;grid-template-columns:2fr 1fr;gap:8px;padding:8px;overflow:hidden}
+  .video{background:#000;display:flex;align-items:center;justify-content:center;border-radius:6px;overflow:hidden}
+  .video img{max-width:100%;max-height:100%;object-fit:contain}
+  .side{display:flex;flex-direction:column;gap:8px;overflow:hidden}
+  .card{background:#1c1c1c;border-radius:6px;padding:10px;overflow:auto}
+  .card h2{margin:0 0 6px;font-size:13px;color:#7cf}
+  .cap{font-size:14px;line-height:1.4;margin-bottom:8px}
+  .meta{color:#aaa;font-size:11px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td{padding:3px 6px;border-bottom:1px solid #2a2a2a}
+  .qty{text-align:right;color:#ffd166}
+  .row{display:flex;gap:6px;align-items:center}
+  input,button,select{background:#222;color:#eee;border:1px solid #333;padding:6px 8px;border-radius:4px;font-size:12px}
+  button{cursor:pointer}
+</style></head>
+<body>
+<div class=wrap>
+  <div class=top>
+    <h1>AiCam — Live</h1>
+    <div class=row>
+      <span id=device class=pill>—</span>
+      <span id=fps class=pill>0 fps</span>
+    </div>
+  </div>
+  <div class=main>
+    <div class=video><img src="/stream" alt="live"/></div>
+    <div class=side>
+      <div class=card>
+        <h2>Latest caption</h2>
+        <div id=cap class=cap>…</div>
+        <div id=capMeta class=meta></div>
+      </div>
+      <div class=card>
+        <h2>Counts (last <select id=since><option>10m</option><option selected>1h</option><option>6h</option><option>24h</option></select>)</h2>
+        <table id=tbl><tbody></tbody></table>
+        <div id=tblMeta class=meta style="margin-top:6px"></div>
+      </div>
+      <div class=card>
+        <h2>Speak on phone</h2>
+        <div class=row>
+          <input id=sayTxt placeholder="text…" style="flex:1"/>
+          <button onclick=doSay()>Say</button>
+        </div>
+        <div id=sayMeta class=meta style="margin-top:4px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+let lastFrameTs=0,frames=0;
+const img=document.querySelector('.video img');
+img.addEventListener('load',()=>{frames++});
+setInterval(()=>{document.getElementById('fps').textContent=frames+' fps';frames=0},1000);
+
+async function refresh(){
+  try{
+    const h=await(await fetch('/healthz')).json();
+    document.getElementById('device').textContent=h.device||'—';
+    const lat=await(await fetch('/api/latest')).json();
+    if(lat&&!lat.empty){
+      document.getElementById('cap').textContent=lat.caption||'(no caption yet)';
+      const yolo=Object.entries(lat.yolo||{}).map(([k,v])=>k+':'+v).join(', ');
+      document.getElementById('capMeta').textContent=lat.iso+(yolo?' · '+yolo:'');
+    }
+    const since=document.getElementById('since').value;
+    const c=await(await fetch('/api/counts?since='+since)).json();
+    const tb=document.querySelector('#tbl tbody');
+    tb.innerHTML='';
+    const e=c.events_by_class||{};
+    Object.entries(e).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
+      tb.insertAdjacentHTML('beforeend','<tr><td>'+k+'</td><td class=qty>'+v+'</td></tr>');
+    });
+    if(!Object.keys(e).length){tb.innerHTML='<tr><td colspan=2 class=meta>(no detections yet)</td></tr>';}
+    document.getElementById('tblMeta').textContent=c.frames+' frames';
+  }catch(e){}
+}
+async function doSay(){
+  const t=document.getElementById('sayTxt').value.trim();
+  if(!t)return;
+  const r=await fetch('/api/say',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
+  const j=await r.json();
+  document.getElementById('sayMeta').textContent='queued #'+j.id;
+  document.getElementById('sayTxt').value='';
+}
+document.getElementById('since').addEventListener('change',refresh);
+refresh();setInterval(refresh,2000);
+</script></body></html>"""
+    return HTMLResponse(html)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8100)
