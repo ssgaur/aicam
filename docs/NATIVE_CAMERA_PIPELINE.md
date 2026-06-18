@@ -81,6 +81,21 @@ stable/playable before pulling and processing it. This avoids corrupt MP4 files
 with errors like `moov atom not found`, but it creates a few seconds of gap
 between chunks.
 
+Clip duration is measured from the actual record tap time. If OnePlus Camera
+takes a few seconds to update its UI, the script still stops at approximately:
+
+```text
+record_tap_time + requested_duration
+```
+
+If OnePlus Camera ignores a start tap while it is still finishing a previous
+save, the script retries the record tap a few times before failing:
+
+```bash
+python native_camera_pipeline.py run --chunks 5 --duration 10 \
+  --start-retries 3 --start-confirm-timeout 4 --start-retry-delay 2
+```
+
 After a clip is verified as playable on the Mac, the script deletes that MP4
 from the phone to avoid filling phone storage. This is the default:
 

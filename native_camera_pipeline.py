@@ -143,11 +143,19 @@ def ensure_camera_idle(audit_log: Path | None = None) -> None:
 def start_recording(args: argparse.Namespace, audit_log: Path | None) -> float:
     if camera_is_recording():
         raise RuntimeError("Camera is already recording before start; refusing to toggle blindly.")
-    start_ts = time.time()
-    tap(args.record_x, args.record_y)
-    if not wait_recording_state(True, timeout=6.0):
-        raise RuntimeError("Tapped record, but OnePlus Camera did not enter recording state.")
-    return start_ts
+    last_tap_ts = 0.0
+    for attempt in range(1, args.start_retries + 1):
+        last_tap_ts = time.time()
+        tap(args.record_x, args.record_y)
+        if wait_recording_state(True, timeout=args.start_confirm_timeout):
+            if attempt > 1:
+                audit_write(audit_log, {"event": "record_start_retry_succeeded", "attempt": attempt})
+            return last_tap_ts
+        audit_write(audit_log, {"event": "record_start_retry", "attempt": attempt, "warning": True})
+        time.sleep(args.start_retry_delay)
+        if camera_is_recording():
+            return last_tap_ts
+    raise RuntimeError("Tapped record, but OnePlus Camera did not enter recording state.")
 
 
 def stop_recording(args: argparse.Namespace, audit_log: Path | None) -> float:
@@ -158,6 +166,12 @@ def stop_recording(args: argparse.Namespace, audit_log: Path | None) -> float:
     if not wait_recording_state(False, timeout=8.0):
         raise RuntimeError("Tapped stop, but OnePlus Camera still appears to be recording.")
     return stop_ts
+
+
+def sleep_until_recording_deadline(start_ts: float, duration: float) -> None:
+    remaining = (start_ts + duration) - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def list_phone_videos() -> list[tuple[float, str]]:
@@ -1069,7 +1083,7 @@ def run_chunks(args: argparse.Namespace) -> None:
             start_ts = start_recording(args, audit_log)
             audit_write(audit_log, {"event": "recording_chunk", "chunk": index + 1, "start_iso": iso(start_ts), "pipelined": False})
 
-        time.sleep(args.duration)
+        sleep_until_recording_deadline(start_ts, args.duration)
         stop_ts = stop_recording(args, audit_log)
         clip_id, local_path, frames_dir = create_clip(start_ts, stop_ts)
         clip_ids.append(clip_id)
@@ -1188,6 +1202,9 @@ def wizard() -> argparse.Namespace:
         save_settle=0.8,
         restart_settle=0.4,
         find_timeout=8.0,
+        start_retries=3,
+        start_confirm_timeout=4.0,
+        start_retry_delay=2.0,
         open_camera=True,
         json_status=False,
         audit=True,
@@ -1240,6 +1257,9 @@ def main() -> int:
     run.add_argument("--save-settle", type=float, default=1.0)
     run.add_argument("--restart-settle", type=float, default=0.8, help="Delay after stop before starting next chunk")
     run.add_argument("--find-timeout", type=float, default=8.0)
+    run.add_argument("--start-retries", type=int, default=3, help="Retry record tap if OnePlus Camera ignores the first tap")
+    run.add_argument("--start-confirm-timeout", type=float, default=4.0, help="Seconds to wait for recording UI after each start tap")
+    run.add_argument("--start-retry-delay", type=float, default=2.0, help="Delay before retrying record start")
     run.add_argument("--open-camera", action=argparse.BooleanOptionalAction, default=True)
     run.add_argument("--audit", action=argparse.BooleanOptionalAction, default=True, help="Write JSONL audit log and summary files")
     run.add_argument("--json-status", action=argparse.BooleanOptionalAction, default=False, help="Print final report as JSON instead of table")
