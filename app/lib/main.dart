@@ -4,9 +4,10 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:network_info_plus/network_info_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-const kDefaultBackend = 'http://192.168.1.56:8100';
+const kDefaultBackend = 'http://192.168.1.72:8100';
 
 late List<CameraDescription> _cameras;
 
@@ -52,6 +53,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   DateTime _lastSec = DateTime.now();
   int _recvInLastSec = 0;
   bool _busy = false;
+  bool _scanning = false;
   String _status = '';
 
   @override
@@ -59,6 +61,90 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initCamera();
+    // Auto-discover backend on launch
+    WidgetsBinding.instance.addPostFrameCallback((_) => _autoDiscover());
+  }
+
+  Future<void> _autoDiscover() async {
+    setState(() {
+      _scanning = true;
+      _status = 'Scanning LAN…';
+    });
+    try {
+      // First try the saved/default URL
+      if (await _ping(_backendCtl.text)) {
+        setState(() {
+          _pingOk = true;
+          _scanning = false;
+          _status = 'Backend found';
+        });
+        return;
+      }
+      // Get phone's own IP, scan its /24
+      final info = NetworkInfo();
+      final ip = await info.getWifiIP();
+      if (ip == null || !ip.contains('.')) {
+        setState(() {
+          _scanning = false;
+          _status = 'No Wi-Fi IP — set backend manually';
+        });
+        return;
+      }
+      final parts = ip.split('.');
+      final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+      // Ping all 254 hosts in parallel
+      final futures = <Future<String?>>[];
+      for (var i = 1; i < 255; i++) {
+        final candidate = 'http://$prefix.$i:8100';
+        futures.add(_pingReturn(candidate));
+      }
+      final results = await Future.wait(futures);
+      String? found;
+      for (final r in results) {
+        if (r != null) {
+          found = r;
+          break;
+        }
+      }
+      if (found != null && mounted) {
+        setState(() {
+          _backendCtl.text = found!;
+          _pingOk = true;
+          _scanning = false;
+          _status = 'Backend auto-discovered';
+        });
+      } else if (mounted) {
+        setState(() {
+          _pingOk = false;
+          _scanning = false;
+          _status = 'Backend not found on LAN — set manually';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _scanning = false;
+          _status = 'Scan error: $e';
+        });
+      }
+    }
+  }
+
+  Future<bool> _ping(String url) async {
+    try {
+      final r = await http.get(Uri.parse('$url/healthz')).timeout(const Duration(milliseconds: 800));
+      return r.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String?> _pingReturn(String url) async {
+    try {
+      final r = await http.get(Uri.parse('$url/healthz')).timeout(const Duration(milliseconds: 600));
+      if (r.statusCode == 200) return url;
+    } catch (_) {}
+    return null;
   }
 
   Future<void> _initCamera() async {
@@ -183,17 +269,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final pingIcon = _pingOk == null
-        ? const Icon(Icons.cloud_queue, color: Colors.grey)
-        : (_pingOk! ? const Icon(Icons.check_circle, color: Colors.green) : const Icon(Icons.cancel, color: Colors.red));
+    final pingIcon = _scanning
+        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+        : (_pingOk == null
+            ? const Icon(Icons.cloud_queue, color: Colors.grey)
+            : (_pingOk! ? const Icon(Icons.check_circle, color: Colors.green) : const Icon(Icons.cancel, color: Colors.red)));
     return Scaffold(
       appBar: AppBar(
         title: const Text('AiCam — SAM 2 Live'),
         actions: [
+          IconButton(
+            tooltip: 'Rescan LAN',
+            onPressed: _scanning ? null : _autoDiscover,
+            icon: const Icon(Icons.radar),
+          ),
           Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Center(child: pingIcon)),
         ],
       ),
-      body: Column(
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: () => FocusScope.of(context).unfocus(),
+        child: Column(
         children: [
           Padding(
             padding: const EdgeInsets.all(8),
@@ -260,6 +356,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
         ],
+        ),
       ),
     );
   }
