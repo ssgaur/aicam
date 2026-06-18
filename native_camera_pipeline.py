@@ -255,6 +255,12 @@ def pull_video(phone_path: str, local_path: Path, *, validate: bool = True) -> N
     raise RuntimeError(last_error or f"Could not pull valid video: {phone_path}")
 
 
+def delete_phone_video(phone_path: str) -> bool:
+    quoted = phone_path.replace("'", "'\\''")
+    proc = adb(["shell", f"rm -f '{quoted}' && test ! -e '{quoted}'"], check=False)
+    return proc.returncode == 0
+
+
 def init_db() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     CLIPS.mkdir(parents=True, exist_ok=True)
@@ -1076,6 +1082,9 @@ def run_chunks(args: argparse.Namespace) -> None:
         # exposes files before their moov atom is always ready, so validating here
         # is safer than overlapping the next recording immediately.
         pull_video(phone_path, local_path)
+        phone_deleted = False
+        if args.delete_phone:
+            phone_deleted = delete_phone_video(phone_path)
         mark_clip_pulled(clip_id, phone_path, local_path, frames_dir)
         work_q.put(ClipJob(clip_id=clip_id, phone_path=phone_path, local_path=local_path, frames_dir=frames_dir))
         audit_write(
@@ -1089,6 +1098,7 @@ def run_chunks(args: argparse.Namespace) -> None:
                 "phone_path": phone_path,
                 "local_path": str(local_path),
                 "local_size_bytes": local_path.stat().st_size if local_path.exists() else 0,
+                "phone_deleted": phone_deleted,
             },
         )
 
@@ -1181,6 +1191,7 @@ def wizard() -> argparse.Namespace:
         open_camera=True,
         json_status=False,
         audit=True,
+        delete_phone=True,
     )
 
 
@@ -1232,6 +1243,7 @@ def main() -> int:
     run.add_argument("--open-camera", action=argparse.BooleanOptionalAction, default=True)
     run.add_argument("--audit", action=argparse.BooleanOptionalAction, default=True, help="Write JSONL audit log and summary files")
     run.add_argument("--json-status", action=argparse.BooleanOptionalAction, default=False, help="Print final report as JSON instead of table")
+    run.add_argument("--delete-phone", action=argparse.BooleanOptionalAction, default=True, help="Delete phone MP4 after verified pull to Mac")
 
     status = sub.add_parser("status", help="Print latest chunk status")
     status.add_argument("--json", action="store_true", dest="json_status")

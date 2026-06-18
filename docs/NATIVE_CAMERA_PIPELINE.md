@@ -81,6 +81,19 @@ stable/playable before pulling and processing it. This avoids corrupt MP4 files
 with errors like `moov atom not found`, but it creates a few seconds of gap
 between chunks.
 
+After a clip is verified as playable on the Mac, the script deletes that MP4
+from the phone to avoid filling phone storage. This is the default:
+
+```bash
+python native_camera_pipeline.py run --chunks 30 --duration 10
+```
+
+To keep MP4s on the phone too:
+
+```bash
+python native_camera_pipeline.py run --chunks 30 --duration 10 --no-delete-phone
+```
+
 ## Check status
 
 ```bash
