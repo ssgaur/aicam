@@ -3,6 +3,7 @@ import asyncio
 import base64
 import io
 import json
+import math
 import os
 import sqlite3
 import time
@@ -31,10 +32,29 @@ SAM_MAX_SIDE = 320
 YOLO_CONF = 0.35
 ROTATE_DEG = int(os.getenv("ROTATE_DEG", "-90"))   # -90 = clockwise 90°, 90 = CCW, 180 = flip
 PROCESS_EVERY_SEC = float(os.getenv("PROCESS_EVERY_SEC", "1.0"))  # heavy pipeline cadence
+TRACK_TTL_SEC = float(os.getenv("TRACK_TTL_SEC", "12.0"))
+TRACK_IOU_MIN = float(os.getenv("TRACK_IOU_MIN", "0.12"))
+TRACK_CENTER_MAX_PX = float(os.getenv("TRACK_CENTER_MAX_PX", "140"))
+TRACK_MOVE_PX = float(os.getenv("TRACK_MOVE_PX", "45"))
+
+TRACKED_CLASSES = {
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat",
+}
+CLASS_CATEGORY = {
+    "person": "human",
+    "dog": "dog",
+    "cat": "animal",
+    "bicycle": "bike",
+    "motorcycle": "bike_scooter",
+    "car": "car",
+    "bus": "vehicle",
+    "truck": "vehicle",
+}
 
 _state = {"sam": None, "yolo": None, "device": None,
           "last_caption_ts": 0.0, "caption_inflight": False,
-          "last_process_ts": 0.0, "process_inflight": False}
+          "last_process_ts": 0.0, "process_inflight": False,
+          "tracks": []}
 
 # 1x1 transparent PNG for "no overlay" replies to phone
 _EMPTY_PNG = (
@@ -72,6 +92,25 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_events_cls_ts ON events(cls, ts);
         CREATE INDEX IF NOT EXISTS idx_frames_ts ON frames(ts);
+        CREATE TABLE IF NOT EXISTS object_tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cls TEXT NOT NULL,
+            category TEXT NOT NULL,
+            first_ts REAL NOT NULL,
+            first_iso TEXT NOT NULL,
+            last_ts REAL NOT NULL,
+            last_iso TEXT NOT NULL,
+            first_box TEXT NOT NULL,
+            last_box TEXT NOT NULL,
+            best_conf REAL NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 1,
+            max_displacement REAL NOT NULL DEFAULT 0,
+            moving INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_object_tracks_cls_last ON object_tracks(cls, last_ts);
+        CREATE INDEX IF NOT EXISTS idx_object_tracks_category_last ON object_tracks(category, last_ts);
+        CREATE INDEX IF NOT EXISTS idx_object_tracks_moving_last ON object_tracks(moving, last_ts);
         CREATE TABLE IF NOT EXISTS say_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts REAL,
@@ -79,6 +118,9 @@ def _init_db():
         );
         """
     )
+    cols = {row[1] for row in con.execute("PRAGMA table_info(events)").fetchall()}
+    if "track_id" not in cols:
+        con.execute("ALTER TABLE events ADD COLUMN track_id INTEGER")
     con.commit()
     con.close()
 
@@ -104,9 +146,43 @@ def _load_models():
     print("[init] models loaded")
 
 
+def _load_active_tracks():
+    t0 = time.time() - TRACK_TTL_SEC
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        """
+        SELECT id, cls, category, first_ts, last_ts, first_box, last_box,
+               best_conf, hits, max_displacement, moving
+        FROM object_tracks
+        WHERE active=1 AND last_ts>=?
+        ORDER BY last_ts ASC
+        """,
+        (t0,),
+    ).fetchall()
+    con.close()
+    _state["tracks"] = [
+        {
+            "id": r[0],
+            "cls": r[1],
+            "category": r[2],
+            "first_ts": r[3],
+            "last_ts": r[4],
+            "first_box": json.loads(r[5]),
+            "last_box": json.loads(r[6]),
+            "best_conf": r[7],
+            "hits": r[8],
+            "max_displacement": r[9],
+            "moving": r[10],
+        }
+        for r in rows
+    ]
+    print(f"[init] active tracks loaded={len(_state['tracks'])}")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _init_db()
+    _load_active_tracks()
     _load_models()
     yield
 
@@ -145,6 +221,175 @@ def _yolo_detect(img: Image.Image):
     return out
 
 
+def _track_category(cls: str) -> str:
+    return CLASS_CATEGORY.get(cls, cls)
+
+
+def _box_center(box: list[float]) -> tuple[float, float]:
+    x1, y1, x2, y2 = box
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def _box_diag(box: list[float]) -> float:
+    x1, y1, x2, y2 = box
+    return math.hypot(max(1.0, x2 - x1), max(1.0, y2 - y1))
+
+
+def _box_iou(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
+def _center_distance(a: list[float], b: list[float]) -> float:
+    ax, ay = _box_center(a)
+    bx, by = _box_center(b)
+    return math.hypot(ax - bx, ay - by)
+
+
+def _track_match_ok(track: dict, det: dict, ts: float) -> tuple[bool, float]:
+    if track["cls"] != det["cls"]:
+        return False, 0.0
+    if ts - track["last_ts"] > TRACK_TTL_SEC:
+        return False, 0.0
+
+    iou = _box_iou(track["last_box"], det["box"])
+    dist = _center_distance(track["last_box"], det["box"])
+    dist_limit = max(TRACK_CENTER_MAX_PX, _box_diag(det["box"]) * 1.25, _box_diag(track["last_box"]) * 1.25)
+    if iou >= TRACK_IOU_MIN:
+        return True, 2.0 + iou
+    if dist <= dist_limit:
+        return True, 1.0 - min(0.99, dist / dist_limit)
+    return False, 0.0
+
+
+def _new_track(con: sqlite3.Connection, ts: float, iso: str, det: dict) -> dict:
+    cls = det["cls"]
+    category = _track_category(cls)
+    box = det["box"]
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO object_tracks(
+            cls, category, first_ts, first_iso, last_ts, last_iso,
+            first_box, last_box, best_conf, hits, max_displacement, moving, active
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (cls, category, ts, iso, ts, iso, json.dumps(box), json.dumps(box), det["conf"], 1, 0.0, 0, 1),
+    )
+    track = {
+        "id": cur.lastrowid,
+        "cls": cls,
+        "category": category,
+        "first_ts": ts,
+        "last_ts": ts,
+        "first_box": box,
+        "last_box": box,
+        "best_conf": det["conf"],
+        "hits": 1,
+        "max_displacement": 0.0,
+        "moving": 0,
+    }
+    _state["tracks"].append(track)
+    return track
+
+
+def _update_track(con: sqlite3.Connection, track: dict, ts: float, iso: str, det: dict) -> dict:
+    first_center = _box_center(track["first_box"])
+    now_center = _box_center(det["box"])
+    displacement = math.hypot(now_center[0] - first_center[0], now_center[1] - first_center[1])
+    track["last_ts"] = ts
+    track["last_box"] = det["box"]
+    track["hits"] += 1
+    track["best_conf"] = max(track["best_conf"], det["conf"])
+    track["max_displacement"] = max(track["max_displacement"], displacement)
+    track["moving"] = 1 if track["max_displacement"] >= TRACK_MOVE_PX and track["hits"] >= 2 else 0
+    con.execute(
+        """
+        UPDATE object_tracks
+        SET last_ts=?, last_iso=?, last_box=?, best_conf=?, hits=?,
+            max_displacement=?, moving=?, active=1
+        WHERE id=?
+        """,
+        (
+            ts,
+            iso,
+            json.dumps(det["box"]),
+            track["best_conf"],
+            track["hits"],
+            track["max_displacement"],
+            track["moving"],
+            track["id"],
+        ),
+    )
+    return track
+
+
+def _expire_tracks(con: sqlite3.Connection, ts: float) -> None:
+    active = []
+    expired_ids = []
+    for track in _state["tracks"]:
+        if ts - track["last_ts"] > TRACK_TTL_SEC:
+            expired_ids.append(track["id"])
+        else:
+            active.append(track)
+    _state["tracks"] = active
+    if expired_ids:
+        con.executemany("UPDATE object_tracks SET active=0 WHERE id=?", [(track_id,) for track_id in expired_ids])
+
+
+def _update_object_tracks(ts: float, iso: str, dets: list) -> list[dict]:
+    """Assign stable track IDs to YOLO detections so counts are unique objects, not per-frame boxes."""
+    tracked_dets = [
+        det for det in dets
+        if det.get("cls") in TRACKED_CLASSES and det.get("conf", 0.0) >= YOLO_CONF
+    ]
+    if not tracked_dets:
+        return []
+
+    con = sqlite3.connect(DB_PATH)
+    try:
+        _expire_tracks(con, ts)
+        matched_track_ids: set[int] = set()
+        assigned_tracks = []
+
+        for det in sorted(tracked_dets, key=lambda d: d["conf"], reverse=True):
+            best_track = None
+            best_score = 0.0
+            for track in _state["tracks"]:
+                if track["id"] in matched_track_ids:
+                    continue
+                ok, score = _track_match_ok(track, det, ts)
+                if ok and score > best_score:
+                    best_track = track
+                    best_score = score
+
+            if best_track is None:
+                best_track = _new_track(con, ts, iso, det)
+            else:
+                _update_track(con, best_track, ts, iso, det)
+
+            matched_track_ids.add(best_track["id"])
+            det["track_id"] = best_track["id"]
+            det["category"] = best_track["category"]
+            det["moving"] = bool(best_track["moving"])
+            assigned_tracks.append(best_track)
+
+        con.commit()
+        return assigned_tracks
+    finally:
+        con.close()
+
+
 def _annotate(img: Image.Image, dets: list, caption: str | None) -> Image.Image:
     out = img.copy()
     d = ImageDraw.Draw(out)
@@ -156,7 +401,9 @@ def _annotate(img: Image.Image, dets: list, caption: str | None) -> Image.Image:
     for det in dets:
         x1, y1, x2, y2 = det["box"]
         d.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
-        d.text((x1 + 4, y1 + 4), f'{det["cls"]} {det["conf"]:.2f}', fill=(255, 255, 255), font=small)
+        track_suffix = f'#{det["track_id"]}' if det.get("track_id") else ""
+        moving_suffix = " moving" if det.get("moving") else ""
+        d.text((x1 + 4, y1 + 4), f'{det["cls"]}{track_suffix} {det["conf"]:.2f}{moving_suffix}', fill=(255, 255, 255), font=small)
     bar_h = 40 if caption else 24
     d.rectangle([0, 0, out.width, bar_h], fill=(0, 0, 0))
     d.text((6, 4), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), fill=(0, 255, 200), font=font)
@@ -215,8 +462,8 @@ def _save_frame(ts: float, img: Image.Image, dets: list, caption: str | None):
     con.execute("INSERT OR REPLACE INTO frames(ts,iso,path,yolo_summary,caption) VALUES(?,?,?,?,?)",
                 (ts, iso, str(path), json.dumps(yolo_summary), caption))
     for d in dets:
-        con.execute("INSERT INTO events(ts,iso,cls,conf,box) VALUES(?,?,?,?,?)",
-                    (ts, iso, d["cls"], d["conf"], json.dumps(d["box"])))
+        con.execute("INSERT INTO events(ts,iso,cls,conf,box,track_id) VALUES(?,?,?,?,?,?)",
+                    (ts, iso, d["cls"], d["conf"], json.dumps(d["box"]), d.get("track_id")))
     con.commit(); con.close()
 
 
@@ -257,6 +504,8 @@ async def _process_frame(jpeg: bytes) -> bytes:
             try:
                 overlay, dets = await asyncio.to_thread(_heavy_process, img_for_proc)
                 ts = time.time()
+                iso = datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat(timespec="seconds")
+                _update_object_tracks(ts, iso, dets)
                 # caption logic
                 caption = None
                 if (not _state["caption_inflight"]) and (ts - _state["last_caption_ts"] >= CAPTION_EVERY_SEC):
@@ -348,8 +597,44 @@ def api_counts(since: str = "1h"):
     con = sqlite3.connect(DB_PATH)
     rows = con.execute("SELECT cls, COUNT(*) FROM events WHERE ts>=? GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall()
     n_frames = con.execute("SELECT COUNT(*) FROM frames WHERE ts>=?", (t0,)).fetchone()[0]
+    unique_rows = con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall()
+    moving_rows = con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? AND moving=1 GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall()
+    category_rows = con.execute("SELECT category, COUNT(*) FROM object_tracks WHERE last_ts>=? GROUP BY category ORDER BY 2 DESC", (t0,)).fetchall()
     con.close()
-    return {"since": since, "since_epoch": t0, "frames": n_frames, "events_by_class": dict(rows)}
+    return {
+        "since": since,
+        "since_epoch": t0,
+        "frames": n_frames,
+        "events_by_class": dict(rows),  # old behavior: repeated per-frame detections
+        "unique_by_class": dict(unique_rows),
+        "moving_unique_by_class": dict(moving_rows),
+        "unique_by_category": dict(category_rows),
+        "unique_tracks": sum(count for _, count in unique_rows),
+        "moving_unique_tracks": sum(count for _, count in moving_rows),
+    }
+
+
+@app.get("/api/object_counts")
+def api_object_counts(since: str = "1h"):
+    t0 = _parse_since(since)
+    con = sqlite3.connect(DB_PATH)
+    by_class = dict(con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall())
+    moving_by_class = dict(con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? AND moving=1 GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall())
+    by_category = dict(con.execute("SELECT category, COUNT(*) FROM object_tracks WHERE last_ts>=? GROUP BY category ORDER BY 2 DESC", (t0,)).fetchall())
+    moving_by_category = dict(con.execute("SELECT category, COUNT(*) FROM object_tracks WHERE last_ts>=? AND moving=1 GROUP BY category ORDER BY 2 DESC", (t0,)).fetchall())
+    active_by_class = dict(con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE active=1 GROUP BY cls ORDER BY 2 DESC").fetchall())
+    con.close()
+    return {
+        "since": since,
+        "since_epoch": t0,
+        "unique_by_class": by_class,
+        "moving_unique_by_class": moving_by_class,
+        "unique_by_category": by_category,
+        "moving_unique_by_category": moving_by_category,
+        "active_by_class": active_by_class,
+        "unique_tracks": sum(by_class.values()),
+        "moving_unique_tracks": sum(moving_by_class.values()),
+    }
 
 
 @app.get("/api/events")
@@ -359,6 +644,41 @@ def api_events(since: str = "10m", limit: int = 500):
     rows = con.execute("SELECT ts, iso, cls, conf FROM events WHERE ts>=? ORDER BY ts DESC LIMIT ?", (t0, limit)).fetchall()
     con.close()
     return [{"ts": r[0], "iso": r[1], "cls": r[2], "conf": r[3]} for r in rows]
+
+
+@app.get("/api/tracks")
+def api_tracks(since: str = "1h", limit: int = 500):
+    t0 = _parse_since(since)
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        """
+        SELECT id, cls, category, first_iso, last_iso, best_conf, hits,
+               max_displacement, moving, active, first_box, last_box
+        FROM object_tracks
+        WHERE last_ts>=?
+        ORDER BY last_ts DESC
+        LIMIT ?
+        """,
+        (t0, limit),
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "id": r[0],
+            "cls": r[1],
+            "category": r[2],
+            "first_iso": r[3],
+            "last_iso": r[4],
+            "best_conf": r[5],
+            "hits": r[6],
+            "max_displacement": r[7],
+            "moving": bool(r[8]),
+            "active": bool(r[9]),
+            "first_box": json.loads(r[10]),
+            "last_box": json.loads(r[11]),
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/captions")
@@ -375,7 +695,8 @@ async def api_summary(since: str = "24h"):
     """Text-only LLM summary over the last `since` of captions + counts."""
     t0 = _parse_since(since)
     con = sqlite3.connect(DB_PATH)
-    counts = dict(con.execute("SELECT cls, COUNT(*) FROM events WHERE ts>=? GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall())
+    counts = dict(con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall())
+    moving_counts = dict(con.execute("SELECT cls, COUNT(*) FROM object_tracks WHERE last_ts>=? AND moving=1 GROUP BY cls ORDER BY 2 DESC", (t0,)).fetchall())
     n_frames = con.execute("SELECT COUNT(*) FROM frames WHERE ts>=?", (t0,)).fetchone()[0]
     caps = con.execute("SELECT iso, caption, yolo_summary FROM frames WHERE caption IS NOT NULL AND ts>=? ORDER BY ts ASC", (t0,)).fetchall()
     con.close()
@@ -406,7 +727,7 @@ async def api_summary(since: str = "24h"):
     deploy = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-4o-mini")
     prompt = (
         f"You are a CCTV log analyst. The camera ran for the last {since}. "
-        f"Total frames analysed: {n_frames}. Object counts (YOLO, total detections): {counts}.\n"
+        f"Total frames analysed: {n_frames}. Unique object tracks: {counts}. Moving object tracks: {moving_counts}.\n"
         f"Hour-bucketed scene captions (sampled):\n{digest}\n\n"
         "Write a concise narrative summary for the home owner, structured as:\n"
         "1) **Overview** (1–2 lines)\n2) **Notable events** (bulleted, with times)\n"
@@ -422,7 +743,7 @@ async def api_summary(since: str = "24h"):
         text = r.choices[0].message.content.strip()
     finally:
         await client.close()
-    return {"since": since, "frames": n_frames, "counts": counts, "summary": text}
+    return {"since": since, "frames": n_frames, "counts": counts, "moving_counts": moving_counts, "summary": text}
 
 
 class SayBody(BaseModel):
@@ -533,7 +854,7 @@ def view_page():
         <div id=capMeta class=meta></div>
       </div>
       <div class=card>
-        <h2>Counts (last <select id=since><option>10m</option><option selected>1h</option><option>6h</option><option>24h</option></select>)</h2>
+        <h2>Unique counts (last <select id=since><option>10m</option><option selected>1h</option><option>6h</option><option>24h</option></select>)</h2>
         <table id=tbl><tbody></tbody></table>
         <div id=tblMeta class=meta style="margin-top:6px"></div>
       </div>
@@ -569,12 +890,12 @@ async function refresh(){
     const c=await(await fetch('/api/counts?since='+since)).json();
     const tb=document.querySelector('#tbl tbody');
     tb.innerHTML='';
-    const e=c.events_by_class||{};
+    const e=c.unique_by_class||{};
     Object.entries(e).sort((a,b)=>b[1]-a[1]).forEach(([k,v])=>{
       tb.insertAdjacentHTML('beforeend','<tr><td>'+k+'</td><td class=qty>'+v+'</td></tr>');
     });
-    if(!Object.keys(e).length){tb.innerHTML='<tr><td colspan=2 class=meta>(no detections yet)</td></tr>';}
-    document.getElementById('tblMeta').textContent=c.frames+' frames';
+    if(!Object.keys(e).length){tb.innerHTML='<tr><td colspan=2 class=meta>(no unique tracks yet)</td></tr>';}
+    document.getElementById('tblMeta').textContent=(c.unique_tracks||0)+' unique · '+(c.moving_unique_tracks||0)+' moving · '+c.frames+' frames';
   }catch(e){}
 }
 async function doSay(){
