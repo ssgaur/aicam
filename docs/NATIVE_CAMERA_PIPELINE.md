@@ -41,6 +41,23 @@ or using the separate Azure captioning/web backend.
 
 ## Start a run
 
+Interactive mode:
+
+```bash
+cd /Users/shailendrasingh/PersonalDev/aicam
+./run_native_camera.sh
+```
+
+The wizard asks:
+
+```text
+How many clips? [30]
+Seconds per clip? [10.0]
+Sample FPS for processing? [3.0]
+```
+
+Direct mode:
+
 ```bash
 cd /Users/shailendrasingh/PersonalDev/aicam
 source venv/bin/activate
@@ -77,6 +94,40 @@ Sampled images: 33 at 3.0 fps
 Detection rows: 29
 Unique object counts: {"person": 2}
 Moving object counts: {"person": 2}
+```
+
+## Audit and final summary
+
+Every run writes:
+
+```text
+data/native_camera/audits/run_YYYYMMDD_HHMMSS.jsonl
+data/native_camera/audits/run_YYYYMMDD_HHMMSS_summary.json
+data/native_camera/audits/run_YYYYMMDD_HHMMSS_summary.md
+```
+
+The final console summary includes:
+
+- current time
+- run start/end
+- where MP4 clips are stored
+- where sampled JPG frames are stored
+- SQLite DB path
+- per-clip object table
+- overall unique counts
+- overall moving counts
+- Azure Vision calls/cost, always `0` for this native pipeline
+
+Example direct run for 15 minutes:
+
+```bash
+python native_camera_pipeline.py run --chunks 30 --duration 30 --sample-fps 3
+```
+
+That means:
+
+```text
+30 clips × 30 sec = 900 sec = 15 min
 ```
 
 ## Data layout

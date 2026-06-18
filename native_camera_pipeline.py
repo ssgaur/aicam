@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data" / "native_camera"
 CLIPS = DATA / "clips"
 FRAMES = DATA / "frames"
+AUDITS = DATA / "audits"
 DB_PATH = DATA / "native_camera.db"
 YOLO_MODEL = ROOT / "checkpoints" / "yolov8n.pt"
 
@@ -146,6 +147,7 @@ def init_db() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     CLIPS.mkdir(parents=True, exist_ok=True)
     FRAMES.mkdir(parents=True, exist_ok=True)
+    AUDITS.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.executescript(
         """
@@ -588,6 +590,248 @@ def clip_counts(clip_id: int) -> dict[str, Any]:
     return {"unique_by_class": by_class, "unique_by_category": by_category, "moving_unique_by_class": moving}
 
 
+def counts_for_clip_ids(clip_ids: list[int]) -> dict[str, Any]:
+    if not clip_ids:
+        return {
+            "unique_by_class": {},
+            "unique_by_category": {},
+            "moving_unique_by_class": {},
+            "moving_unique_by_category": {},
+            "unique_tracks": 0,
+            "moving_unique_tracks": 0,
+        }
+    placeholders = ",".join("?" for _ in clip_ids)
+    con = sqlite3.connect(DB_PATH)
+    by_class = dict(
+        con.execute(
+            f"""
+            SELECT t.cls, COUNT(DISTINCT t.id)
+            FROM object_tracks t
+            JOIN detections d ON d.track_id=t.id
+            WHERE d.clip_id IN ({placeholders})
+            GROUP BY t.cls ORDER BY 2 DESC
+            """,
+            clip_ids,
+        ).fetchall()
+    )
+    by_category = dict(
+        con.execute(
+            f"""
+            SELECT t.category, COUNT(DISTINCT t.id)
+            FROM object_tracks t
+            JOIN detections d ON d.track_id=t.id
+            WHERE d.clip_id IN ({placeholders})
+            GROUP BY t.category ORDER BY 2 DESC
+            """,
+            clip_ids,
+        ).fetchall()
+    )
+    moving_by_class = dict(
+        con.execute(
+            f"""
+            SELECT t.cls, COUNT(DISTINCT t.id)
+            FROM object_tracks t
+            JOIN detections d ON d.track_id=t.id
+            WHERE d.clip_id IN ({placeholders}) AND t.moving=1
+            GROUP BY t.cls ORDER BY 2 DESC
+            """,
+            clip_ids,
+        ).fetchall()
+    )
+    moving_by_category = dict(
+        con.execute(
+            f"""
+            SELECT t.category, COUNT(DISTINCT t.id)
+            FROM object_tracks t
+            JOIN detections d ON d.track_id=t.id
+            WHERE d.clip_id IN ({placeholders}) AND t.moving=1
+            GROUP BY t.category ORDER BY 2 DESC
+            """,
+            clip_ids,
+        ).fetchall()
+    )
+    con.close()
+    return {
+        "unique_by_class": by_class,
+        "unique_by_category": by_category,
+        "moving_unique_by_class": moving_by_class,
+        "moving_unique_by_category": moving_by_category,
+        "unique_tracks": sum(by_class.values()),
+        "moving_unique_tracks": sum(moving_by_class.values()),
+    }
+
+
+def clip_rows(clip_ids: list[int]) -> list[dict[str, Any]]:
+    if not clip_ids:
+        return []
+    placeholders = ",".join("?" for _ in clip_ids)
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        f"SELECT * FROM clips WHERE id IN ({placeholders}) ORDER BY id ASC",
+        clip_ids,
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["counts"] = clip_counts(int(row["id"]))
+        out.append(item)
+    con.close()
+    return out
+
+
+def dir_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    if not path.exists():
+        return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            total += child.stat().st_size
+    return total
+
+
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{num_bytes} B"
+
+
+def format_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "-"
+    return ", ".join(f"{key}:{value}" for key, value in sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def make_run_report(
+    *,
+    run_id: str,
+    started_ts: float,
+    finished_ts: float,
+    clip_ids: list[int],
+    args: argparse.Namespace,
+    audit_log: Path,
+) -> dict[str, Any]:
+    clips = clip_rows(clip_ids)
+    totals = counts_for_clip_ids(clip_ids)
+    clip_paths = [Path(c["local_path"]) for c in clips if c.get("local_path")]
+    frame_dirs = [Path(c["frames_dir"]) for c in clips if c.get("frames_dir")]
+    storage = {
+        "clips_bytes": sum(dir_size(p) for p in clip_paths),
+        "frames_bytes": sum(dir_size(p) for p in frame_dirs),
+    }
+    storage["total_bytes"] = storage["clips_bytes"] + storage["frames_bytes"]
+
+    report = {
+        "run_id": run_id,
+        "started_iso": iso(started_ts),
+        "finished_iso": iso(finished_ts),
+        "duration_sec": round(finished_ts - started_ts, 3),
+        "requested_chunks": args.chunks,
+        "requested_chunk_duration_sec": args.duration,
+        "sample_fps": args.sample_fps,
+        "confidence": args.conf,
+        "audit_log": str(audit_log),
+        "db_path": str(DB_PATH),
+        "clips_dir": str(CLIPS),
+        "frames_dir": str(FRAMES),
+        "clips_total": len(clips),
+        "clips_processed": sum(1 for c in clips if c.get("status") == "processed"),
+        "clips_error": sum(1 for c in clips if c.get("status") == "error"),
+        "sampled_frames_total": sum(int(c.get("sampled_frames") or 0) for c in clips),
+        "storage": {
+            **storage,
+            "clips": human_size(storage["clips_bytes"]),
+            "frames": human_size(storage["frames_bytes"]),
+            "total": human_size(storage["total_bytes"]),
+        },
+        "totals": totals,
+        "clips": clips,
+        "azure_vision_calls": 0,
+        "azure_vision_cost": 0.0,
+        "copilot_required": False,
+        "internet_required_after_setup": False,
+    }
+    return report
+
+
+def write_report_files(report: dict[str, Any]) -> tuple[Path, Path]:
+    report_json = AUDITS / f"{report['run_id']}_summary.json"
+    report_md = AUDITS / f"{report['run_id']}_summary.md"
+    report_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    lines = [
+        f"# Native Camera Run {report['run_id']}",
+        "",
+        f"- Started: `{report['started_iso']}`",
+        f"- Finished: `{report['finished_iso']}`",
+        f"- Clips: `{report['clips_processed']}/{report['clips_total']}` processed",
+        f"- Sampled frames: `{report['sampled_frames_total']}`",
+        f"- Storage: `{report['storage']['total']}` (clips `{report['storage']['clips']}`, frames `{report['storage']['frames']}`)",
+        f"- Azure Vision calls: `{report['azure_vision_calls']}`",
+        f"- Azure Vision cost: `${report['azure_vision_cost']:.2f}`",
+        "",
+        "## Overall counts",
+        "",
+        f"- Unique: `{format_counts(report['totals']['unique_by_class'])}`",
+        f"- Moving: `{format_counts(report['totals']['moving_unique_by_class'])}`",
+        "",
+        "## Per-clip table",
+        "",
+        "| Clip | Time | Frames | Counts | Moving | File |",
+        "| ---: | --- | ---: | --- | --- | --- |",
+    ]
+    for c in report["clips"]:
+        counts = c["counts"]
+        lines.append(
+            "| {id} | {start} → {end} | {frames} | {counts} | {moving} | `{file}` |".format(
+                id=c["id"],
+                start=c["start_iso"],
+                end=c["end_iso"],
+                frames=c.get("sampled_frames") or 0,
+                counts=format_counts(counts["unique_by_class"]),
+                moving=format_counts(counts["moving_unique_by_class"]),
+                file=c.get("local_path") or "",
+            )
+        )
+    lines.extend(["", f"Audit log: `{report['audit_log']}`", f"SQLite DB: `{report['db_path']}`", ""])
+    report_md.write_text("\n".join(lines), encoding="utf-8")
+    return report_json, report_md
+
+
+def print_run_summary(report: dict[str, Any], report_json: Path, report_md: Path) -> None:
+    print("\n=== FINAL RUN SUMMARY ===")
+    print(f"Current time: {iso(time.time())}")
+    print(f"Run: {report['started_iso']} → {report['finished_iso']}")
+    print(f"Clips processed: {report['clips_processed']}/{report['clips_total']}")
+    print(f"Sampled images: {report['sampled_frames_total']}")
+    print(f"Storage: {report['storage']['total']} (clips {report['storage']['clips']}, frames {report['storage']['frames']})")
+    print(f"Azure Vision API calls: {report['azure_vision_calls']} · cost ${report['azure_vision_cost']:.2f}")
+    print(f"Overall unique counts: {format_counts(report['totals']['unique_by_class'])}")
+    print(f"Overall moving counts: {format_counts(report['totals']['moving_unique_by_class'])}")
+    print(f"Clips folder: {CLIPS}")
+    print(f"Frames folder: {FRAMES}")
+    print(f"SQLite DB: {DB_PATH}")
+    print(f"Audit log: {report['audit_log']}")
+    print(f"Summary JSON: {report_json}")
+    print(f"Summary Markdown: {report_md}")
+    print("\nPer-clip object table:")
+    print(f"{'Clip':>4}  {'Time':<43}  {'Frames':>6}  {'Counts':<28}  {'Moving'}")
+    print("-" * 104)
+    for c in report["clips"]:
+        counts = c["counts"]
+        print(
+            f"{c['id']:>4}  {c['start_iso']} → {c['end_iso']:<25}  "
+            f"{int(c.get('sampled_frames') or 0):>6}  "
+            f"{format_counts(counts['unique_by_class']):<28}  "
+            f"{format_counts(counts['moving_unique_by_class'])}"
+        )
+
+
 def latest_status() -> dict[str, Any]:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -630,7 +874,7 @@ def print_status(*, json_mode: bool = False) -> None:
     print("Moving object counts: " + (json.dumps(status["moving_unique_by_class"], sort_keys=True) if status["moving_unique_by_class"] else "{}"))
 
 
-def worker_loop(work_q: "queue.Queue[ClipJob | None]", sample_fps: float, conf: float) -> None:
+def worker_loop(work_q: "queue.Queue[ClipJob | None]", sample_fps: float, conf: float, audit_log: Path | None) -> None:
     model, device = load_model()
     tracker = GlobalTracker()
     while True:
@@ -641,33 +885,59 @@ def worker_loop(work_q: "queue.Queue[ClipJob | None]", sample_fps: float, conf: 
         try:
             process_clip(job, model, device, tracker, sample_fps, conf)
             counts = clip_counts(job.clip_id)
-            print(
-                json.dumps(
-                    {
-                        "processed_clip": job.clip_id,
-                        "file": str(job.local_path),
-                        "frames_dir": str(job.frames_dir),
-                        **counts,
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
+            audit_write(
+                audit_log,
+                {
+                    "event": "processed_clip",
+                    "clip_id": job.clip_id,
+                    "file": str(job.local_path),
+                    "frames_dir": str(job.frames_dir),
+                    **counts,
+                },
             )
         except Exception as exc:
             mark_clip_error(job.clip_id, str(exc))
-            print(json.dumps({"processed_clip": job.clip_id, "error": str(exc)}, ensure_ascii=False), flush=True)
+            audit_write(audit_log, {"event": "processed_clip_error", "clip_id": job.clip_id, "error": str(exc)})
         finally:
             work_q.task_done()
+
+
+def audit_write(audit_log: Path | None, event: dict[str, Any]) -> None:
+    event = {"ts": iso(time.time()), **event}
+    line = json.dumps(event, ensure_ascii=False)
+    print(line, flush=True)
+    if audit_log:
+        with audit_log.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def run_chunks(args: argparse.Namespace) -> None:
     init_db()
     device_ready()
+    run_started_ts = time.time()
+    run_id = datetime.fromtimestamp(run_started_ts).strftime("run_%Y%m%d_%H%M%S")
+    audit_log = AUDITS / f"{run_id}.jsonl" if args.audit else None
+    clip_ids: list[int] = []
+    if audit_log:
+        audit_log.parent.mkdir(parents=True, exist_ok=True)
+        audit_log.write_text("", encoding="utf-8")
+    audit_write(
+        audit_log,
+        {
+            "event": "run_start",
+            "run_id": run_id,
+            "chunks": args.chunks,
+            "duration": args.duration,
+            "sample_fps": args.sample_fps,
+            "conf": args.conf,
+            "offline_local": True,
+        },
+    )
     if args.open_camera:
         launch_video_camera()
 
     work_q: "queue.Queue[ClipJob | None]" = queue.Queue()
-    worker = threading.Thread(target=worker_loop, args=(work_q, args.sample_fps, args.conf), daemon=True)
+    worker = threading.Thread(target=worker_loop, args=(work_q, args.sample_fps, args.conf, audit_log), daemon=True)
     worker.start()
 
     known = {path for _, path in list_phone_videos()}
@@ -675,16 +945,17 @@ def run_chunks(args: argparse.Namespace) -> None:
     start_ts = 0.0
     for index in range(args.chunks):
         if recording_already_started:
-            print(json.dumps({"recording_chunk": index + 1, "start_iso": iso(start_ts), "pipelined": True}, ensure_ascii=False), flush=True)
+            audit_write(audit_log, {"event": "recording_chunk", "chunk": index + 1, "start_iso": iso(start_ts), "pipelined": True})
         else:
             start_ts = time.time()
-            print(json.dumps({"recording_chunk": index + 1, "start_iso": iso(start_ts), "pipelined": False}, ensure_ascii=False), flush=True)
+            audit_write(audit_log, {"event": "recording_chunk", "chunk": index + 1, "start_iso": iso(start_ts), "pipelined": False})
             tap(args.record_x, args.record_y)
 
         time.sleep(args.duration)
         stop_ts = time.time()
         tap(args.record_x, args.record_y)
         clip_id, local_path, frames_dir = create_clip(start_ts, stop_ts)
+        clip_ids.append(clip_id)
 
         time.sleep(args.save_settle)
         phone_path = wait_for_new_video(known, stop_ts, timeout=args.find_timeout)
@@ -696,35 +967,31 @@ def run_chunks(args: argparse.Namespace) -> None:
             time.sleep(args.restart_settle)
             next_start_ts = time.time()
             tap(args.record_x, args.record_y)
-            print(
-                json.dumps(
-                    {
-                        "started_next_chunk": index + 2,
-                        "start_iso": iso(next_start_ts),
-                        "gap_sec": round(next_start_ts - stop_ts, 3),
-                    },
-                    ensure_ascii=False,
-                ),
-                flush=True,
+            audit_write(
+                audit_log,
+                {
+                    "event": "started_next_chunk",
+                    "chunk": index + 2,
+                    "start_iso": iso(next_start_ts),
+                    "gap_sec": round(next_start_ts - stop_ts, 3),
+                },
             )
 
         # Pull/process previous clip while the next chunk is already recording.
         pull_video(phone_path, local_path)
         mark_clip_pulled(clip_id, phone_path, local_path, frames_dir)
         work_q.put(ClipJob(clip_id=clip_id, phone_path=phone_path, local_path=local_path, frames_dir=frames_dir))
-        print(
-            json.dumps(
-                {
-                    "pulled_clip": clip_id,
-                    "chunk": index + 1,
-                    "from": iso(start_ts),
-                    "to": iso(stop_ts),
-                    "phone_path": phone_path,
-                    "local_path": str(local_path),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
+        audit_write(
+            audit_log,
+            {
+                "event": "pulled_clip",
+                "clip_id": clip_id,
+                "chunk": index + 1,
+                "from": iso(start_ts),
+                "to": iso(stop_ts),
+                "phone_path": phone_path,
+                "local_path": str(local_path),
+            },
         )
 
         if start_next:
@@ -735,7 +1002,73 @@ def run_chunks(args: argparse.Namespace) -> None:
 
     work_q.put(None)
     work_q.join()
-    print_status(json_mode=args.json_status)
+    report = make_run_report(
+        run_id=run_id,
+        started_ts=run_started_ts,
+        finished_ts=time.time(),
+        clip_ids=clip_ids,
+        args=args,
+        audit_log=audit_log or Path(""),
+    )
+    report_json, report_md = write_report_files(report)
+    audit_write(
+        audit_log,
+        {
+            "event": "run_complete",
+            "run_id": run_id,
+            "summary_json": str(report_json),
+            "summary_markdown": str(report_md),
+            "unique_by_class": report["totals"]["unique_by_class"],
+            "moving_unique_by_class": report["totals"]["moving_unique_by_class"],
+        },
+    )
+    if args.json_status:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print_run_summary(report, report_json, report_md)
+
+
+def prompt_int(prompt: str, default: int) -> int:
+    value = input(f"{prompt} [{default}]: ").strip()
+    if value.lower() in {"q", "quit", "n", "no", "cancel"}:
+        raise SystemExit("Cancelled.")
+    return default if not value else int(value)
+
+
+def prompt_float(prompt: str, default: float) -> float:
+    value = input(f"{prompt} [{default}]: ").strip()
+    if value.lower() in {"q", "quit", "n", "no", "cancel"}:
+        raise SystemExit("Cancelled.")
+    return default if not value else float(value)
+
+
+def wizard() -> argparse.Namespace:
+    print("Native Camera Pipeline Wizard")
+    print("This uses OnePlus Camera + ADB + local YOLO. No Copilot/Azure needed for processing.")
+    chunks = prompt_int("How many clips?", 30)
+    duration = prompt_float("Seconds per clip?", 10.0)
+    sample_fps = prompt_float("Sample FPS for processing?", 3.0)
+    total_sec = chunks * duration
+    print(f"Plan: {chunks} clips × {duration:g}s = {total_sec:g}s ({total_sec/60:.1f} min)")
+    print("Data will be stored under:", DATA)
+    confirm = input("Start now? [Y/n]: ").strip().lower()
+    if confirm in {"n", "no"}:
+        raise SystemExit("Cancelled.")
+    return argparse.Namespace(
+        cmd="run",
+        chunks=chunks,
+        duration=duration,
+        sample_fps=sample_fps,
+        conf=0.35,
+        record_x=540,
+        record_y=2037,
+        save_settle=0.8,
+        restart_settle=0.4,
+        find_timeout=8.0,
+        open_camera=True,
+        json_status=False,
+        audit=True,
+    )
 
 
 def reset_db() -> None:
@@ -763,14 +1096,19 @@ def main() -> int:
     run.add_argument("--restart-settle", type=float, default=0.8, help="Delay after stop before starting next chunk")
     run.add_argument("--find-timeout", type=float, default=8.0)
     run.add_argument("--open-camera", action=argparse.BooleanOptionalAction, default=True)
+    run.add_argument("--audit", action=argparse.BooleanOptionalAction, default=True, help="Write JSONL audit log and summary files")
+    run.add_argument("--json-status", action=argparse.BooleanOptionalAction, default=False, help="Print final report as JSON instead of table")
 
     status = sub.add_parser("status", help="Print latest chunk status")
     status.add_argument("--json", action="store_true", dest="json_status")
+    sub.add_parser("wizard", help="Interactive prompt for clip count/duration, then run")
     sub.add_parser("reset-db", help="Backup and reset native camera SQLite DB")
 
     args = parser.parse_args()
-    if args.cmd == "run":
-        args.json_status = getattr(args, "json_status", True)
+    if args.cmd == "wizard":
+        args = wizard()
+        run_chunks(args)
+    elif args.cmd == "run":
         run_chunks(args)
     elif args.cmd == "status":
         init_db()

@@ -35,6 +35,9 @@ source venv/bin/activate
 
 # Record 10-second MP4 chunks, pull them from the phone, sample frames at 3 FPS,
 # run local YOLO tracking, and store clips/frames/counts in SQLite.
+./run_native_camera.sh
+
+# Or run directly:
 python native_camera_pipeline.py run --chunks 30 --duration 10 --sample-fps 3
 
 # Ask what happened most recently.
