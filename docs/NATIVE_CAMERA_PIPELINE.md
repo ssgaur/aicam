@@ -75,6 +75,12 @@ adb shell input tap 540 2037   # stop
 adb pull /sdcard/DCIM/Camera/VID_....mp4
 ```
 
+The script first checks the OnePlus Camera UI state and will stop an already
+running recording before starting a new run. It also waits for each MP4 to become
+stable/playable before pulling and processing it. This avoids corrupt MP4 files
+with errors like `moov atom not found`, but it creates a few seconds of gap
+between chunks.
+
 ## Check status
 
 ```bash

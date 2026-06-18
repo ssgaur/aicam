@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,12 +89,75 @@ def device_ready() -> None:
 
 
 def launch_video_camera() -> None:
-    adb(["shell", "am", "start", "-a", "android.media.action.VIDEO_CAPTURE", "--ei", "android.intent.extra.durationLimit", "10"])
+    adb(["shell", "am", "start", "-a", "android.media.action.VIDEO_CAPTURE"])
     time.sleep(2.5)
 
 
 def tap(x: int, y: int) -> None:
     adb(["shell", "input", "tap", str(x), str(y)])
+
+
+def camera_ui_root() -> ET.Element | None:
+    adb(["shell", "uiautomator", "dump", "/sdcard/window.xml"], check=False)
+    proc = adb(["exec-out", "cat", "/sdcard/window.xml"], check=False)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        return ET.fromstring(proc.stdout)
+    except ET.ParseError:
+        return None
+
+
+def camera_is_recording() -> bool:
+    root = camera_ui_root()
+    if root is None:
+        return False
+    for node in root.iter("node"):
+        rid = node.attrib.get("resource-id", "")
+        if rid in {
+            "com.oneplus.camera:id/recording_timer_main_container",
+            "com.oneplus.camera:id/video_recording_pause_resume_button",
+            "com.oneplus.camera:id/video_recording_pause_resume_button_container",
+        }:
+            return True
+    return False
+
+
+def wait_recording_state(want_recording: bool, timeout: float = 6.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if camera_is_recording() == want_recording:
+            return True
+        time.sleep(0.25)
+    return camera_is_recording() == want_recording
+
+
+def ensure_camera_idle(audit_log: Path | None = None) -> None:
+    if camera_is_recording():
+        audit_write(audit_log, {"event": "camera_was_recording_before_run", "action": "tap_stop"})
+        tap(540, 2037)
+        wait_recording_state(False, timeout=8.0)
+        time.sleep(3.0)
+
+
+def start_recording(args: argparse.Namespace, audit_log: Path | None) -> float:
+    if camera_is_recording():
+        raise RuntimeError("Camera is already recording before start; refusing to toggle blindly.")
+    start_ts = time.time()
+    tap(args.record_x, args.record_y)
+    if not wait_recording_state(True, timeout=6.0):
+        raise RuntimeError("Tapped record, but OnePlus Camera did not enter recording state.")
+    return start_ts
+
+
+def stop_recording(args: argparse.Namespace, audit_log: Path | None) -> float:
+    if not camera_is_recording():
+        audit_write(audit_log, {"event": "camera_not_recording_at_stop", "warning": True})
+    stop_ts = time.time()
+    tap(args.record_x, args.record_y)
+    if not wait_recording_state(False, timeout=8.0):
+        raise RuntimeError("Tapped stop, but OnePlus Camera still appears to be recording.")
+    return stop_ts
 
 
 def list_phone_videos() -> list[tuple[float, str]]:
@@ -136,11 +200,59 @@ def wait_for_new_video(before: set[str], min_mtime: float, timeout: float = 8.0)
     raise RuntimeError("No recorded video found on phone after stopping recording.")
 
 
-def pull_video(phone_path: str, local_path: Path) -> None:
+def phone_file_size(path: str) -> int:
+    quoted = path.replace("'", "'\\''")
+    proc = adb(["shell", f"stat -c %s '{quoted}'"], check=False)
+    if proc.returncode != 0:
+        return 0
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def wait_phone_file_stable(phone_path: str, timeout: float = 20.0, min_size: int = 1_000_000) -> int:
+    deadline = time.time() + timeout
+    last_size = -1
+    stable_count = 0
+    while time.time() < deadline:
+        size = phone_file_size(phone_path)
+        if size >= min_size and size == last_size:
+            stable_count += 1
+        else:
+            stable_count = 0
+        if stable_count >= 2:
+            return size
+        last_size = size
+        time.sleep(1.0)
+    return phone_file_size(phone_path)
+
+
+def local_video_ok(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size < 1_000_000:
+        return False
+    cap = cv2.VideoCapture(str(path))
+    try:
+        return bool(cap.isOpened() and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 and cap.get(cv2.CAP_PROP_FPS) > 0)
+    finally:
+        cap.release()
+
+
+def pull_video(phone_path: str, local_path: Path, *, validate: bool = True) -> None:
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    adb(["pull", phone_path, str(local_path)])
-    if not local_path.exists() or local_path.stat().st_size == 0:
-        raise RuntimeError(f"Pulled file is missing/empty: {local_path}")
+    wait_phone_file_stable(phone_path)
+    last_error = ""
+    for attempt in range(1, 6):
+        adb(["pull", phone_path, str(local_path)])
+        if not local_path.exists() or local_path.stat().st_size == 0:
+            last_error = f"Pulled file is missing/empty: {local_path}"
+        elif (not validate) or local_video_ok(local_path):
+            return
+        else:
+            last_error = f"Pulled MP4 is not playable yet: {local_path}"
+        time.sleep(2.0 * attempt)
+        wait_phone_file_stable(phone_path)
+    raise RuntimeError(last_error or f"Could not pull valid video: {phone_path}")
 
 
 def init_db() -> None:
@@ -935,6 +1047,7 @@ def run_chunks(args: argparse.Namespace) -> None:
     )
     if args.open_camera:
         launch_video_camera()
+    ensure_camera_idle(audit_log)
 
     work_q: "queue.Queue[ClipJob | None]" = queue.Queue()
     worker = threading.Thread(target=worker_loop, args=(work_q, args.sample_fps, args.conf, audit_log), daemon=True)
@@ -947,13 +1060,11 @@ def run_chunks(args: argparse.Namespace) -> None:
         if recording_already_started:
             audit_write(audit_log, {"event": "recording_chunk", "chunk": index + 1, "start_iso": iso(start_ts), "pipelined": True})
         else:
-            start_ts = time.time()
+            start_ts = start_recording(args, audit_log)
             audit_write(audit_log, {"event": "recording_chunk", "chunk": index + 1, "start_iso": iso(start_ts), "pipelined": False})
-            tap(args.record_x, args.record_y)
 
         time.sleep(args.duration)
-        stop_ts = time.time()
-        tap(args.record_x, args.record_y)
+        stop_ts = stop_recording(args, audit_log)
         clip_id, local_path, frames_dir = create_clip(start_ts, stop_ts)
         clip_ids.append(clip_id)
 
@@ -961,23 +1072,9 @@ def run_chunks(args: argparse.Namespace) -> None:
         phone_path = wait_for_new_video(known, stop_ts, timeout=args.find_timeout)
         known.add(phone_path)
 
-        next_start_ts = 0.0
-        start_next = index < args.chunks - 1
-        if start_next:
-            time.sleep(args.restart_settle)
-            next_start_ts = time.time()
-            tap(args.record_x, args.record_y)
-            audit_write(
-                audit_log,
-                {
-                    "event": "started_next_chunk",
-                    "chunk": index + 2,
-                    "start_iso": iso(next_start_ts),
-                    "gap_sec": round(next_start_ts - stop_ts, 3),
-                },
-            )
-
-        # Pull/process previous clip while the next chunk is already recording.
+        # Pull and validate the completed MP4 before the next toggle. OnePlus
+        # exposes files before their moov atom is always ready, so validating here
+        # is safer than overlapping the next recording immediately.
         pull_video(phone_path, local_path)
         mark_clip_pulled(clip_id, phone_path, local_path, frames_dir)
         work_q.put(ClipJob(clip_id=clip_id, phone_path=phone_path, local_path=local_path, frames_dir=frames_dir))
@@ -991,8 +1088,24 @@ def run_chunks(args: argparse.Namespace) -> None:
                 "to": iso(stop_ts),
                 "phone_path": phone_path,
                 "local_path": str(local_path),
+                "local_size_bytes": local_path.stat().st_size if local_path.exists() else 0,
             },
         )
+
+        next_start_ts = 0.0
+        start_next = index < args.chunks - 1
+        if start_next:
+            time.sleep(args.restart_settle)
+            next_start_ts = start_recording(args, audit_log)
+            audit_write(
+                audit_log,
+                {
+                    "event": "started_next_chunk",
+                    "chunk": index + 2,
+                    "start_iso": iso(next_start_ts),
+                    "gap_sec": round(next_start_ts - stop_ts, 3),
+                },
+            )
 
         if start_next:
             recording_already_started = True
