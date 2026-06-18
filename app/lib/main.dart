@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -55,14 +56,54 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _busy = false;
   bool _scanning = false;
   String _status = '';
+  final FlutterTts _tts = FlutterTts();
+  int _lastSayId = 0;
+  Timer? _sayTimer;
+  String _lastSpoken = '';
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _initCamera();
-    // Auto-discover backend on launch
-    WidgetsBinding.instance.addPostFrameCallback((_) => _autoDiscover());
+    _initTts();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _autoDiscover();
+      _startSayPoll();
+    });
+  }
+
+  Future<void> _initTts() async {
+    await _tts.setLanguage('en-US');
+    await _tts.setSpeechRate(0.5);
+    await _tts.setPitch(1.0);
+    await _tts.setVolume(1.0);
+  }
+
+  void _startSayPoll() {
+    _sayTimer?.cancel();
+    _sayTimer = Timer.periodic(const Duration(seconds: 2), (_) => _pollSay());
+  }
+
+  Future<void> _pollSay() async {
+    if (_pingOk != true) return;
+    try {
+      final r = await http
+          .get(Uri.parse('${_backendCtl.text}/api/say/pending?since=$_lastSayId'))
+          .timeout(const Duration(seconds: 3));
+      if (r.statusCode != 200) return;
+      final list = jsonDecode(r.body) as List<dynamic>;
+      for (final m in list) {
+        final id = m['id'] as int;
+        final text = (m['text'] as String?) ?? '';
+        if (id > _lastSayId) _lastSayId = id;
+        if (text.trim().isEmpty) continue;
+        await _tts.speak(text);
+        if (mounted) setState(() => _lastSpoken = text);
+        // wait approximately for speech to finish before next
+        await Future.delayed(Duration(milliseconds: 300 + text.length * 60));
+      }
+    } catch (_) {}
   }
 
   Future<void> _autoDiscover() async {
@@ -168,6 +209,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _sayTimer?.cancel();
+    _tts.stop();
     _stopStream();
     _cam?.dispose();
     _backendCtl.dispose();
@@ -336,6 +379,31 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           ),
                         ),
                       ),
+                      if (_lastSpoken.isNotEmpty)
+                        Positioned(
+                          left: 8,
+                          right: 8,
+                          bottom: 8,
+                          child: Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.6),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.volume_up, color: Colors.cyanAccent, size: 18),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    _lastSpoken,
+                                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
                     ],
                   )
                 : Center(child: Text(_status.isEmpty ? 'Initializing camera…' : _status)),

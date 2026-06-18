@@ -38,6 +38,7 @@ dependencies:
   web_socket_channel: ^3.0.3
   http: ^1.6.0
   network_info_plus: ^8.1.0
+  flutter_tts: ^4.2.5
 
 dev_dependencies:
   flutter_test:

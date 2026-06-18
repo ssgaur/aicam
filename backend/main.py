@@ -1,19 +1,4 @@
-"""AiCam backend — SAM 2 + YOLOv8 + per-frame logging + periodic captioning.
-
-Per WS frame (~1 FPS):
-  1. SAM 2 mask overlay (returned to phone for live preview)
-  2. YOLOv8n object detection -> sqlite events
-  3. Save annotated JPG -> data/snaps/<ts>.jpg + data/latest.jpg
-  4. Every CAPTION_EVERY_SEC: send to gpt-4o-mini vision -> caption -> sqlite
-
-REST:
-  GET /healthz                -> status
-  GET /api/latest             -> latest snapshot info
-  GET /api/events?since=...   -> raw events
-  GET /api/counts?since=...   -> class -> count
-  GET /api/summary?since=24h  -> LLM narrative summary (text-only LLM over events)
-  GET /snap/latest.jpg        -> raw image
-"""
+"""AiCam backend — SAM 2 + YOLOv8 + per-frame logging + periodic captioning + TTS messages."""
 import asyncio
 import base64
 import io
@@ -22,14 +7,15 @@ import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
@@ -75,6 +61,11 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_events_cls_ts ON events(cls, ts);
         CREATE INDEX IF NOT EXISTS idx_frames_ts ON frames(ts);
+        CREATE TABLE IF NOT EXISTS say_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL,
+            text TEXT
+        );
         """
     )
     con.commit()
@@ -403,6 +394,29 @@ async def api_summary(since: str = "24h"):
     finally:
         await client.close()
     return {"since": since, "frames": n_frames, "counts": counts, "summary": text}
+
+
+class SayBody(BaseModel):
+    text: str
+
+
+@app.post("/api/say")
+def api_say(body: SayBody):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("INSERT INTO say_queue(ts, text) VALUES(?, ?)", (time.time(), body.text))
+    con.commit()
+    new_id = cur.lastrowid
+    con.close()
+    return {"id": new_id, "text": body.text}
+
+
+@app.get("/api/say/pending")
+def api_say_pending(since: int = 0):
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT id, ts, text FROM say_queue WHERE id>? ORDER BY id ASC", (since,)).fetchall()
+    con.close()
+    return [{"id": r[0], "ts": r[1], "text": r[2]} for r in rows]
 
 
 if __name__ == "__main__":
