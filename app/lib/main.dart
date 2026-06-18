@@ -307,6 +307,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _recvInLastSec = 0;
       _lastSec = now;
     }
+    // ignore tiny ack PNGs (< 500 bytes = transparent acknowledgement, no overlay to draw)
+    if (bytes.length < 500) {
+      if (_overlay != null && mounted) setState(() => _overlay = null);
+      return;
+    }
     if (mounted) setState(() => _overlay = bytes);
   }
 
