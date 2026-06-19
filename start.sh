@@ -220,6 +220,7 @@ fi
 echo "  Viewer:   http://localhost:8100/viewer"
 echo "  Status:   http://localhost:8100/api/native/status"
 echo "  Logs:     tail -f data/server.log"
+echo "  Process:  tail -f data/processing.log"
 echo ""
 echo "  Next steps:"
 echo "    1. On your Android phone → open AiCameraX app"

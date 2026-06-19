@@ -38,7 +38,17 @@ TO_BE_DELETED = DATA / "to-be-deleted"
 TO_BE_DELETED_CLIPS = TO_BE_DELETED / "clips"
 TO_BE_DELETED_FRAMES = TO_BE_DELETED / "frames"
 DB_PATH = DATA / "native_camera.db"
+PROCESSING_LOG = ROOT / "data" / "processing.log"
 YOLO_MODEL = ROOT / "checkpoints" / "yolov8n.pt"
+
+
+def _plog(msg: str) -> None:
+    """Append a line to data/processing.log (tail -f friendly)."""
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with PROCESSING_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 TRACKED_CLASSES = {"person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat"}
 CLASS_CATEGORY = {
@@ -729,6 +739,7 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
         job.frames_dir.mkdir(parents=True, exist_ok=True)
 
         sampled_count = 0
+        _plog(f"━━━ clip #{job.clip_id} START ━━━ duration={duration:.1f}s fps={video_fps:.0f} path={job.local_path}")
         for frame_index, video_t in enumerate(sample_times(duration, sample_fps)):
             cap.set(cv2.CAP_PROP_POS_MSEC, video_t * 1000.0)
             ok, frame_bgr = cap.read()
@@ -767,9 +778,12 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
                         json.dumps(det["box"]),
                     ),
                 )
+            obj_names = ", ".join(d["cls"] for d in assigned) if assigned else "—"
+            _plog(f"  frame {frame_index:02d} | {frame_path.name} | objects={len(assigned)} | {obj_names}")
             sampled_count += 1
             con.commit()
         cap.release()
+        _plog(f"━━━ clip #{job.clip_id} DONE ━━━ frames={sampled_count} stored={job.frames_dir}")
 
         con.execute(
             """

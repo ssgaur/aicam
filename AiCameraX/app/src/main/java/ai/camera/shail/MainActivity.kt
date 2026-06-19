@@ -77,7 +77,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-private const val DEFAULT_BACKEND = "http://192.168.1.72:8100"
+private const val DEFAULT_BACKEND = "http://localhost:8100"
 
 class MainActivity : ComponentActivity() {
     private var previewView: PreviewView? = null

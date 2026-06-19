@@ -226,7 +226,38 @@ async def lifespan(_app: FastAPI):
     _load_active_tracks()
     _load_models()
     native_cam.init_db()
+    # Re-queue clips interrupted by a previous shutdown (status='pulled' = uploaded but not processed)
+    _requeue_unprocessed_clips()
     yield
+
+
+def _requeue_unprocessed_clips():
+    """Find clips with status='pulled' (saved to disk but never processed) and requeue them."""
+    con = sqlite3.connect(native_cam.DB_PATH)
+    rows = con.execute(
+        "SELECT id, phone_path, local_path, frames_dir FROM clips WHERE status='pulled' ORDER BY id"
+    ).fetchall()
+    con.close()
+    if not rows:
+        return
+    print(f"[startup] Re-queuing {len(rows)} interrupted clip(s): {[r[0] for r in rows]}")
+    _ensure_native_upload_worker()
+    for r in rows:
+        clip_id, phone_path, local_path, frames_dir = r
+        if local_path and Path(local_path).exists():
+            _native_upload_queue.put({
+                "job": native_cam.ClipJob(
+                    clip_id=clip_id,
+                    phone_path=phone_path or "",
+                    local_path=Path(local_path),
+                    frames_dir=Path(frames_dir) if frames_dir else Path(local_path).parent / "frames",
+                ),
+                "sample_fps": 2.0,
+                "conf": 0.35,
+            })
+        else:
+            native_cam.mark_clip_error(clip_id, "MP4 missing on disk after restart")
+            print(f"[startup] clip_id={clip_id} MP4 not found, marked error")
 
 
 app = FastAPI(title="AiCam", lifespan=lifespan)
@@ -684,6 +715,62 @@ def api_native_status():
     return status
 
 
+@app.get("/api/native/live")
+def api_native_live():
+    """Rich live processing status for terminal monitoring."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    con.row_factory = sqlite3.Row
+    now = time.time()
+
+    # Last 5 clips
+    recent = con.execute(
+        "SELECT id, start_iso, end_iso, status, duration_sec, sampled_frames FROM clips ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+
+    # Currently processing (status != 'done')
+    processing = con.execute(
+        "SELECT id, start_iso, status FROM clips WHERE status != 'done' ORDER BY id DESC LIMIT 3"
+    ).fetchall()
+
+    # Total clips today
+    today_start = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    total_today = con.execute("SELECT COUNT(*) FROM clips WHERE start_ts >= ?", (today_start,)).fetchone()[0]
+
+    # Detections from last 5 clips
+    last_clip_ids = [r["id"] for r in recent]
+    det_summary = {}
+    if last_clip_ids:
+        placeholders = ",".join("?" * len(last_clip_ids))
+        dets = con.execute(
+            f"SELECT cls, COUNT(*) as cnt FROM detections WHERE clip_id IN ({placeholders}) GROUP BY cls ORDER BY cnt DESC",
+            last_clip_ids,
+        ).fetchall()
+        det_summary = {r["cls"]: r["cnt"] for r in dets}
+
+    # Last clip arrival gap
+    last_clip = recent[0] if recent else None
+    last_arrival_ago = round(now - last_clip["end_ts"], 1) if last_clip else None
+    # Read end_ts properly
+    if last_clip:
+        end_ts = con.execute("SELECT end_ts FROM clips WHERE id=?", (last_clip["id"],)).fetchone()[0]
+        last_arrival_ago = round(now - end_ts, 1)
+
+    con.close()
+
+    return {
+        "now": datetime.now().strftime("%H:%M:%S"),
+        "state": "processing" if processing else "idle",
+        "queue_depth": _native_upload_queue.qsize(),
+        "worker_alive": bool(_native_upload_worker and _native_upload_worker.is_alive()),
+        "total_clips_today": total_today,
+        "last_clip_ago_sec": last_arrival_ago,
+        "processing": [dict(r) for r in processing],
+        "recent_clips": [dict(r) for r in recent],
+        "recent_detections": det_summary,
+    }
+
+
 @app.get("/api/native/summary")
 def api_native_summary(since: str = "10m"):
     """Postgres-backed durable summary; survives MP4/JPG cleanup."""
@@ -780,6 +867,20 @@ def serve_frame(frame_id: int):
     con.close()
     if not row or not row[0] or not Path(row[0]).exists():
         return JSONResponse({"error": "frame not found"}, status_code=404)
+    return _FR(row[0], media_type="image/jpeg")
+
+
+@app.get("/media/clip/{clip_id}/thumb")
+def serve_clip_thumb(clip_id: int):
+    """Serve first frame of a clip as thumbnail."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    row = con.execute(
+        "SELECT path FROM sampled_frames WHERE clip_id=? ORDER BY id LIMIT 1", (clip_id,)
+    ).fetchone()
+    con.close()
+    if not row or not row[0] or not Path(row[0]).exists():
+        return JSONResponse({"error": "no thumb"}, status_code=404)
     return _FR(row[0], media_type="image/jpeg")
 
 

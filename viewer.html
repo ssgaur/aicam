@@ -43,18 +43,20 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .timeline-footer .window-label{color:var(--accent);font-weight:600}
 .timeline-footer .total-label{color:var(--muted)}
 
-/* Clip List */
+/* Clip Grid */
 .clips-section{padding:0 20px 20px}
 .clips-section h3{font-size:13px;color:var(--muted);margin-bottom:10px;padding-left:4px}
-.clips-list{display:flex;flex-direction:column;gap:8px}
-.clip-row{display:flex;align-items:center;gap:14px;background:var(--card);border-radius:10px;padding:12px 16px;cursor:pointer;transition:background .15s,transform .1s}
-.clip-row:hover{background:var(--card2);transform:translateX(4px)}
-.clip-row.active{background:var(--accent);color:#000}
-.clip-row.active .clip-r-time,.clip-row.active .clip-r-meta{color:#000}
-.clip-r-id{font-size:12px;font-weight:700;background:var(--accent2);color:#fff;padding:3px 8px;border-radius:6px;min-width:44px;text-align:center}
-.clip-row.active .clip-r-id{background:#000;color:var(--accent)}
-.clip-r-time{font-size:13px;font-weight:500}
-.clip-r-meta{font-size:11px;color:var(--muted)}
+.clips-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.clip-card{position:relative;background:var(--card);border-radius:10px;overflow:hidden;cursor:pointer;transition:transform .15s,box-shadow .15s}
+.clip-card:hover{transform:translateY(-2px);box-shadow:0 4px 20px rgba(79,140,255,.2)}
+.clip-card.active{outline:2px solid var(--accent)}
+.clip-thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:var(--card2);display:block}
+.clip-thumb-placeholder{width:100%;aspect-ratio:16/9;background:var(--card2);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:24px}
+.clip-card-info{padding:8px 10px}
+.clip-card-id{font-size:11px;font-weight:700;background:var(--accent2);color:#fff;padding:2px 6px;border-radius:4px;display:inline-block;margin-bottom:4px}
+.clip-card.active .clip-card-id{background:var(--accent)}
+.clip-card-time{font-size:12px;font-weight:500}
+.clip-card-meta{font-size:10px;color:var(--muted);margin-top:2px}
 
 /* Full-screen Player */
 .player-overlay{position:fixed;inset:0;background:rgba(0,0,0,.96);z-index:500;display:none;flex-direction:column}
@@ -83,13 +85,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .frame-thumb.active{border-color:var(--accent)}
 
 /* Frame Fullscreen */
-.frame-full{position:fixed;inset:0;background:rgba(0,0,0,.95);z-index:600;display:none;align-items:center;justify-content:center;cursor:zoom-out}
+.frame-full{position:fixed;inset:0;background:rgba(0,0,0,.95);z-index:600;display:none;align-items:center;justify-content:center}
 .frame-full.visible{display:flex}
-.frame-full img{max-width:95%;max-height:90%;border-radius:8px}
+.frame-full img{max-width:90%;max-height:80%;border-radius:8px}
 .frame-full-nav{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:44px;border-radius:50%;background:var(--card);border:1px solid var(--border);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:20px}
 .frame-full-nav:hover{background:var(--accent);color:#000}
 .frame-full-nav.left{left:20px}
 .frame-full-nav.right{right:20px}
+.frame-full-close{position:absolute;top:16px;right:20px;background:none;border:none;color:var(--muted);font-size:28px;cursor:pointer;z-index:10}
+.frame-full-close:hover{color:var(--text)}
 .frame-full-info{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card);padding:6px 16px;border-radius:20px;font-size:12px;color:var(--muted)}
 
 .empty-state{text-align:center;padding:60px 20px;color:var(--muted);font-size:14px}
@@ -156,10 +160,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 </div>
 
 <!-- Frame full-screen -->
-<div class="frame-full" id="frameFull" onclick="closeFrameFull(event)">
-  <button class="frame-full-nav left" onclick="event.stopPropagation();navFrame(-1)">◀</button>
+<div class="frame-full" id="frameFull">
+  <button class="frame-full-close" onclick="closeFrameFull()">✕</button>
+  <button class="frame-full-nav left" onclick="navFrame(-1)">◀</button>
   <img id="frameFullImg" src="">
-  <button class="frame-full-nav right" onclick="event.stopPropagation();navFrame(1)">▶</button>
+  <button class="frame-full-nav right" onclick="navFrame(1)">▶</button>
   <div class="frame-full-info" id="frameFullInfo"></div>
 </div>
 
@@ -251,7 +256,6 @@ function updateSliderUI(){
   document.getElementById('ttRight').style.transform='translateX(-100%)';
   document.getElementById('windowLabel').textContent=`${fmtTime(w.start)} — ${fmtTime(w.end)}`;
 }
-}
 
 // ─── Dragging ───
 const sliderArea=document.getElementById('sliderArea');
@@ -311,11 +315,12 @@ async function loadClips(){
     document.getElementById('totalLabel').textContent=`${totalClips} total`;
     if(!currentClips.length){list.innerHTML='<div class="empty-state">No clips here — drag the window</div>';return;}
     list.innerHTML=currentClips.map((c,i)=>`
-      <div class="clip-row" onclick="openClip(${i})" id="crow-${i}">
-        <span class="clip-r-id">#${c.id}</span>
-        <div>
-          <div class="clip-r-time">${fmtIST(c.start_ts)}</div>
-          <div class="clip-r-meta">${c.duration_sec?c.duration_sec.toFixed(1)+'s':'~10s'} · ${c.sampled_frames||0} frames</div>
+      <div class="clip-card" onclick="openClip(${i})" id="crow-${i}">
+        <img class="clip-thumb" src="${API}/media/clip/${c.id}/thumb" onerror="this.outerHTML='<div class=\\'clip-thumb-placeholder\\'>🎬</div>'">
+        <div class="clip-card-info">
+          <span class="clip-card-id">#${c.id}</span>
+          <div class="clip-card-time">${fmtTime(c.start_ts)}</div>
+          <div class="clip-card-meta">${c.duration_sec?c.duration_sec.toFixed(1)+'s':'~10s'} · ${c.sampled_frames||0} frames</div>
         </div>
       </div>
     `).join('');
@@ -326,7 +331,7 @@ async function loadClips(){
 function openClip(idx){
   currentClipIdx=idx;
   const c=currentClips[idx];if(!c)return;
-  document.querySelectorAll('.clip-row').forEach(r=>r.classList.remove('active'));
+  document.querySelectorAll('.clip-card').forEach(r=>r.classList.remove('active'));
   const row=document.getElementById('crow-'+idx);if(row)row.classList.add('active');
 
   document.getElementById('playerOverlay').classList.add('visible');
@@ -378,7 +383,7 @@ function showFrame(){
   // highlight thumb
   document.querySelectorAll('.frame-thumb').forEach((t,i)=>t.classList.toggle('active',i===currentFrameIdx));
 }
-function closeFrameFull(e){if(e.target===document.getElementById('frameFull')||e.target===document.getElementById('frameFullImg'))document.getElementById('frameFull').classList.remove('visible');}
+function closeFrameFull(){document.getElementById('frameFull').classList.remove('visible');}
 function navFrame(dir){
   currentFrameIdx=Math.max(0,Math.min(currentFrames.length-1,currentFrameIdx+dir));
   showFrame();
