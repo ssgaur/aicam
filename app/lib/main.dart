@@ -123,11 +123,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       // First try the saved/default URL
       if (await _ping(_backendCtl.text)) {
-        setState(() {
-          _pingOk = true;
-          _scanning = false;
-          _status = 'Backend found';
-        });
+        await _setBackendAndPing(_backendCtl.text, 'Backend connected');
         return;
       }
       // Get phone's own IP, scan its /24
@@ -157,12 +153,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
       }
       if (found != null && mounted) {
-        setState(() {
-          _backendCtl.text = found!;
-          _pingOk = true;
-          _scanning = false;
-          _status = 'Backend auto-discovered';
-        });
+        await _setBackendAndPing(found, 'Backend auto-discovered');
       } else if (mounted) {
         setState(() {
           _pingOk = false;
@@ -189,12 +180,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _setBackendAndPing(String url, String successStatus) async {
+    _backendCtl.text = url;
+    final ok = await _ping(url);
+    if (!mounted) return;
+    setState(() {
+      _pingOk = ok;
+      _scanning = false;
+      _status = ok ? successStatus : 'Backend not reachable — set manually';
+    });
+  }
+
   Future<String?> _pingReturn(String url) async {
     try {
       final r = await http.get(Uri.parse('$url/healthz')).timeout(const Duration(milliseconds: 600));
       if (r.statusCode == 200) return url;
     } catch (_) {}
     return null;
+  }
+
+  void _onBackendChanged(String value) {
+    setState(() {
+      _pingOk = null;
+      _status = 'Backend URL changed — tap Test';
+    });
   }
 
   Future<void> _initCamera() async {
@@ -230,12 +239,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _testBackend() async {
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _status = 'Testing backend…';
+    });
     try {
       final r = await http.get(Uri.parse('${_backendCtl.text}/healthz')).timeout(const Duration(seconds: 4));
-      setState(() => _pingOk = r.statusCode == 200);
+      setState(() {
+        _pingOk = r.statusCode == 200;
+        _status = r.statusCode == 200 ? 'Backend connected' : 'Backend test failed (${r.statusCode})';
+      });
     } catch (_) {
-      setState(() => _pingOk = false);
+      setState(() {
+        _pingOk = false;
+        _status = 'Backend not reachable — set manually';
+      });
     } finally {
       setState(() => _busy = false);
     }
@@ -483,6 +501,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 Expanded(
                   child: TextField(
                     controller: _backendCtl,
+                    onChanged: _onBackendChanged,
                     decoration: const InputDecoration(labelText: 'Backend', isDense: true, border: OutlineInputBorder()),
                   ),
                 ),
