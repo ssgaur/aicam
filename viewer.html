@@ -179,7 +179,9 @@ async function init(){
   try{
     const r=await fetch(`${API}/api/native/clips/range`);
     const d=await r.json();
-    gMin=d.min_ts||0;gMax=d.max_ts||Date.now()/1000;totalClips=d.total_clips||0;
+    gMin=d.min_ts||0;
+    gMax=Math.max(d.max_ts||0, Date.now()/1000); // always extend to current time
+    totalClips=d.total_clips||0;
     document.getElementById('liveDot').className='dot on';
     document.getElementById('headerInfo').textContent=`${totalClips} clips total`;
     positionSliderAtEnd();
@@ -208,12 +210,13 @@ function setWindow(m){
 }
 
 function getWindowTs(){
-  const range=gMax-gMin;
+  const now=Date.now()/1000;
+  const range=Math.max(now,gMax)-gMin;
   const winSec=windowMin*60;
-  const maxCenter=gMax-winSec/2;
+  const maxCenter=now-winSec/2;
   const minCenter=gMin+winSec/2;
   const center=minCenter+(maxCenter-minCenter)*sliderPct;
-  return{start:Math.max(gMin,center-winSec/2),end:Math.min(gMax,center+winSec/2)};
+  return{start:Math.max(gMin,center-winSec/2),end:Math.min(now,center+winSec/2)};
 }
 
 function positionSliderAtEnd(){sliderPct=1;updateSliderUI();}
@@ -387,7 +390,7 @@ document.addEventListener('keydown',e=>{
 init();
 // Auto-refresh every 30s
 setInterval(()=>{if(!dragging&&!document.getElementById('playerOverlay').classList.contains('visible')){
-  fetch(`${API}/api/native/clips/range`).then(r=>r.json()).then(d=>{gMax=d.max_ts||gMax;totalClips=d.total_clips||totalClips;document.getElementById('headerInfo').textContent=totalClips+' clips total';if(sliderPct>.95){sliderPct=1;updateSliderUI();loadClips();}}).catch(()=>{});
+  fetch(`${API}/api/native/clips/range`).then(r=>r.json()).then(d=>{gMax=Math.max(d.max_ts||0,Date.now()/1000);totalClips=d.total_clips||totalClips;document.getElementById('headerInfo').textContent=totalClips+' clips total';if(sliderPct>.95){sliderPct=1;updateSliderUI();loadClips();}}).catch(()=>{});
 }},30000);
 </script>
 </body>
