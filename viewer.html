@@ -101,6 +101,13 @@ async function init() {
     totalClips = d.total_clips || 0;
     document.getElementById('connStatus').textContent = 'connected';
     document.getElementById('connStatus').classList.add('ok');
+    // Default: show last 5 minutes
+    const range = globalMax - globalMin;
+    if (range > 0) {
+      const last5m = Math.max(0, 1 - (300 / range));
+      document.getElementById('rangeStart').value = Math.round(last5m * 1000);
+      document.getElementById('rangeEnd').value = 1000;
+    }
     updateLabels();
     loadClips();
   } catch(e) {
