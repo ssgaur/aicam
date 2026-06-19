@@ -223,11 +223,12 @@ function updateSliderUI(){
   if(range<=0)return;
   const winSec=windowMin*60;
   const winFrac=Math.min(1,winSec/range);
-  const maxCenter=gMax-winSec/2;
-  const minCenter=gMin+winSec/2;
-  const centerPx=sliderPct; // 0..1
-  const leftPct=Math.max(0,(centerPx - winFrac/2))*100;
-  const widthPct=winFrac*100;
+  // Clamp slider so window never goes past edges
+  const halfWin=winFrac/2;
+  const clampedPct=Math.max(halfWin,Math.min(1-halfWin,sliderPct));
+  sliderPct=clampedPct;
+  const leftPct=Math.max(0,Math.min(100-winFrac*100,(clampedPct-halfWin)*100));
+  const widthPct=Math.min(100,winFrac*100);
   const sw=document.getElementById('sliderWindow');
   sw.style.left=leftPct+'%';
   sw.style.width=widthPct+'%';
@@ -237,9 +238,10 @@ function updateSliderUI(){
   document.getElementById('ttLeft').classList.add('visible');
   document.getElementById('ttRight').textContent=fmtIST(w.end);
   document.getElementById('ttRight').classList.add('visible');
-  // position tooltips
+  // position tooltips clamped inside container
   document.getElementById('ttLeft').style.left=leftPct+'%';
-  document.getElementById('ttRight').style.left=(leftPct+widthPct)+'%';
+  document.getElementById('ttRight').style.left=Math.min(100,leftPct+widthPct)+'%';
+  document.getElementById('ttRight').style.transform='translateX(-100%)';
   document.getElementById('windowLabel').textContent=`${fmtTime(w.start)} — ${fmtTime(w.end)}`;
 }
 
@@ -257,7 +259,10 @@ function onDrag(e){
   if(!dragging)return;
   const rect=sliderArea.getBoundingClientRect();
   const dx=(e.clientX-dragStartX)/rect.width;
-  sliderPct=Math.max(0,Math.min(1,dragStartPct+dx));
+  const range=gMax-gMin;
+  const winSec=windowMin*60;
+  const halfWin=Math.min(1,winSec/range)/2;
+  sliderPct=Math.max(halfWin,Math.min(1-halfWin,dragStartPct+dx));
   updateSliderUI();
 }
 function endDrag(){
@@ -270,7 +275,10 @@ function endDrag(){
 sliderArea.addEventListener('click',e=>{
   if(dragging)return;
   const rect=sliderArea.getBoundingClientRect();
-  sliderPct=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width));
+  const range=gMax-gMin;
+  const winSec=windowMin*60;
+  const halfWin=Math.min(1,winSec/range)/2;
+  sliderPct=Math.max(halfWin,Math.min(1-halfWin,(e.clientX-rect.left)/rect.width));
   updateSliderUI();
   loadClips();
 });
