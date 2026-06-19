@@ -202,10 +202,12 @@ function fmtTime(ts){
 }
 
 // ─── Window logic ───
+// sliderPct = position of the window's RIGHT EDGE on the timeline (0=start, 1=now)
 function setWindow(m){
   windowMin=m;
   document.querySelectorAll('.window-btns button').forEach(b=>b.classList.toggle('active',+b.dataset.win===m));
-  positionSliderAtEnd();
+  sliderPct=1; // snap to latest
+  updateSliderUI();
   loadClips();
 }
 
@@ -214,10 +216,10 @@ function getWindowTs(){
   const effectiveMax=Math.max(gMax,now);
   const range=effectiveMax-gMin;
   const winSec=windowMin*60;
-  const maxCenter=effectiveMax-winSec/2;
-  const minCenter=gMin+winSec/2;
-  const center=minCenter+(maxCenter-minCenter)*sliderPct;
-  return{start:Math.max(gMin,center-winSec/2),end:Math.min(effectiveMax,center+winSec/2)};
+  // sliderPct=1 means window end = effectiveMax (now)
+  const windowEnd=gMin + range*sliderPct;
+  const windowStart=windowEnd - winSec;
+  return{start:Math.max(gMin,windowStart), end:Math.min(effectiveMax,windowEnd)};
 }
 
 function positionSliderAtEnd(){sliderPct=1;updateSliderUI();}
@@ -229,11 +231,11 @@ function updateSliderUI(){
   if(range<=0)return;
   const winSec=windowMin*60;
   const winFrac=Math.min(1,winSec/range);
-  // Clamp slider so window never goes past edges
-  const halfWin=winFrac/2;
-  const clampedPct=Math.max(halfWin,Math.min(1-halfWin,sliderPct));
-  sliderPct=clampedPct;
-  const leftPct=Math.max(0,Math.min(100-winFrac*100,(clampedPct-halfWin)*100));
+  // Clamp: window end can't go below gMin+winSec, can't exceed effectiveMax
+  const minPct=Math.min(1,winSec/range); // minimum sliderPct so window start >= gMin
+  sliderPct=Math.max(minPct,Math.min(1,sliderPct));
+  // Visual: window occupies [sliderPct-winFrac .. sliderPct] of the track
+  const leftPct=Math.max(0,(sliderPct-winFrac)*100);
   const widthPct=Math.min(100,winFrac*100);
   const sw=document.getElementById('sliderWindow');
   sw.style.left=leftPct+'%';
@@ -244,11 +246,11 @@ function updateSliderUI(){
   document.getElementById('ttLeft').classList.add('visible');
   document.getElementById('ttRight').textContent=fmtIST(w.end);
   document.getElementById('ttRight').classList.add('visible');
-  // position tooltips clamped inside container
   document.getElementById('ttLeft').style.left=leftPct+'%';
   document.getElementById('ttRight').style.left=Math.min(100,leftPct+widthPct)+'%';
   document.getElementById('ttRight').style.transform='translateX(-100%)';
   document.getElementById('windowLabel').textContent=`${fmtTime(w.start)} — ${fmtTime(w.end)}`;
+}
 }
 
 // ─── Dragging ───
@@ -269,8 +271,8 @@ function onDrag(e){
   const effectiveMax=Math.max(gMax,now);
   const range=effectiveMax-gMin;
   const winSec=windowMin*60;
-  const halfWin=Math.min(1,winSec/range)/2;
-  sliderPct=Math.max(halfWin,Math.min(1-halfWin,dragStartPct+dx));
+  const minPct=Math.min(1,winSec/range);
+  sliderPct=Math.max(minPct,Math.min(1,dragStartPct+dx));
   updateSliderUI();
 }
 function endDrag(){
@@ -283,12 +285,15 @@ function endDrag(){
 sliderArea.addEventListener('click',e=>{
   if(dragging)return;
   const rect=sliderArea.getBoundingClientRect();
+  const clickPct=(e.clientX-rect.left)/rect.width;
   const now=Date.now()/1000;
   const effectiveMax=Math.max(gMax,now);
   const range=effectiveMax-gMin;
   const winSec=windowMin*60;
-  const halfWin=Math.min(1,winSec/range)/2;
-  sliderPct=Math.max(halfWin,Math.min(1-halfWin,(e.clientX-rect.left)/rect.width));
+  const winFrac=Math.min(1,winSec/range);
+  // Clicked position = right edge of window
+  const minPct=Math.min(1,winSec/range);
+  sliderPct=Math.max(minPct,Math.min(1,clickPct+winFrac/2));
   updateSliderUI();
   loadClips();
 });
