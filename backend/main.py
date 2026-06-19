@@ -814,8 +814,141 @@ def api_native_clips(start: float = 0, end: float = 0):
             "local_path": r[5], "frames_dir": r[6],
             "duration_sec": r[7], "sampled_frames": r[8], "status": r[9],
         })
+    # Enrich clips with detection counts from SQLite
+    clip_ids = [c["id"] for c in clips]
+    if clip_ids:
+        con2 = sqlite3.connect(native_cam.DB_PATH)
+        placeholders = ",".join("?" * len(clip_ids))
+        # Object counts per clip
+        det_rows = con2.execute(
+            f"SELECT clip_id, cls, COUNT(*) FROM detections WHERE clip_id IN ({placeholders}) GROUP BY clip_id, cls",
+            clip_ids,
+        ).fetchall()
+        # Moving tracks per clip
+        track_rows = con2.execute(
+            f"""SELECT first_clip_id as clip_id, cls, moving
+                FROM object_tracks WHERE first_clip_id IN ({placeholders})""",
+            clip_ids,
+        ).fetchall()
+        con2.close()
+
+        # Build lookup: clip_id -> {objects:{cls:count}, moving:[cls,...]}
+        clip_det = {}
+        for cid, cls, cnt in det_rows:
+            clip_det.setdefault(cid, {}).setdefault("objects", {})[cls] = cnt
+        clip_tracks = {}
+        for cid, cls, moving in track_rows:
+            clip_tracks.setdefault(cid, []).append({"cls": cls, "moving": bool(moving)})
+
+        for c in clips:
+            c["objects"] = clip_det.get(c["id"], {}).get("objects", {})
+            c["tracks"] = clip_tracks.get(c["id"], [])
+            c["has_activity"] = any(t["moving"] for t in c["tracks"]) if c["tracks"] else bool(c["objects"])
+    else:
+        for c in clips:
+            c["objects"] = {}
+            c["tracks"] = []
+            c["has_activity"] = False
+
     con.close()
     return {"start": start, "end": end, "count": len(clips), "clips": clips}
+
+
+@app.get("/api/native/insights")
+def api_native_insights(start: float = 0, end: float = 0):
+    """AI-style insights: timeline narrative, object stats, cross-clip tracking."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    if end <= 0:
+        end = time.time()
+    if start <= 0:
+        start = end - 3600
+
+    # Overall stats
+    total = con.execute("SELECT COUNT(*) FROM clips WHERE end_ts >= ? AND start_ts <= ?", (start, end)).fetchone()[0]
+    empty = con.execute(
+        """SELECT COUNT(*) FROM clips c WHERE c.end_ts >= ? AND c.start_ts <= ?
+           AND c.id NOT IN (SELECT DISTINCT clip_id FROM detections)""",
+        (start, end),
+    ).fetchone()[0]
+
+    # Object class totals
+    class_stats = con.execute(
+        """SELECT d.cls, COUNT(DISTINCT d.track_id) as tracks, COUNT(*) as detections
+           FROM detections d JOIN clips c ON d.clip_id=c.id
+           WHERE c.end_ts >= ? AND c.start_ts <= ?
+           GROUP BY d.cls ORDER BY tracks DESC""",
+        (start, end),
+    ).fetchall()
+
+    # Cross-clip tracked objects (objects seen in multiple clips)
+    cross_clip = con.execute(
+        """SELECT t.id, t.cls, t.first_clip_id, t.last_clip_id, t.hits, t.moving,
+                  t.first_ts, t.last_ts, t.best_conf, t.max_displacement
+           FROM object_tracks t
+           WHERE t.first_ts >= ? AND t.first_ts <= ?
+           ORDER BY t.hits DESC LIMIT 20""",
+        (start, end),
+    ).fetchall()
+
+    # Time-bucketed activity (5-min buckets)
+    bucket_sec = 300
+    buckets = []
+    cursor = start
+    while cursor < end:
+        bkt_end = min(cursor + bucket_sec, end)
+        det_count = con.execute(
+            """SELECT COUNT(DISTINCT d.track_id) FROM detections d JOIN clips c ON d.clip_id=c.id
+               WHERE c.start_ts >= ? AND c.start_ts < ?""",
+            (cursor, bkt_end),
+        ).fetchone()[0]
+        cls_in_bucket = con.execute(
+            """SELECT d.cls, COUNT(DISTINCT d.track_id) FROM detections d JOIN clips c ON d.clip_id=c.id
+               WHERE c.start_ts >= ? AND c.start_ts < ? GROUP BY d.cls ORDER BY COUNT(DISTINCT d.track_id) DESC LIMIT 3""",
+            (cursor, bkt_end),
+        ).fetchall()
+        if det_count > 0:
+            buckets.append({
+                "start_ts": cursor, "end_ts": bkt_end,
+                "unique_objects": det_count,
+                "top_classes": {cls: cnt for cls, cnt in cls_in_bucket},
+            })
+        cursor = bkt_end
+
+    # Generate narrative
+    narratives = []
+    for b in buckets:
+        t = time.strftime("%I:%M %p", time.localtime(b["start_ts"]))
+        top = list(b["top_classes"].items())
+        if top:
+            parts = [f"{cnt} {cls}{'s' if cnt > 1 else ''}" for cls, cnt in top]
+            narratives.append(f"Around {t}: spotted {', '.join(parts)}")
+
+    # Overall narrative
+    if total > 0 and empty == total:
+        overall = "🔇 Quiet period — no objects detected in any clip."
+    elif empty > total * 0.7:
+        overall = f"Mostly quiet. {empty}/{total} clips had zero activity. {total-empty} clips captured movement."
+    else:
+        active = total - empty
+        overall = f"Active scene: {active}/{total} clips detected objects."
+
+    con.close()
+    return {
+        "total_clips": total,
+        "empty_clips": empty,
+        "active_clips": total - empty,
+        "overall": overall,
+        "class_stats": [{"cls": r[0], "tracks": r[1], "detections": r[2]} for r in class_stats],
+        "cross_clip_tracks": [
+            {"id": r[0], "cls": r[1], "first_clip": r[2], "last_clip": r[3],
+             "hits": r[4], "moving": bool(r[5]), "first_ts": r[6], "last_ts": r[7],
+             "confidence": round(r[8], 2), "displacement_px": round(r[9], 1)}
+            for r in cross_clip
+        ],
+        "activity_timeline": buckets,
+        "narratives": narratives,
+    }
 
 
 @app.get("/api/native/clips/{clip_id}/frames")

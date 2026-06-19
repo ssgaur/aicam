@@ -58,6 +58,45 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .clip-card-time{font-size:12px;font-weight:500}
 .clip-card-meta{font-size:10px;color:var(--muted);margin-top:2px}
 
+/* Detection badges */
+.clip-badge{position:absolute;top:6px;right:6px;padding:2px 7px;border-radius:10px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.clip-badge.empty{background:rgba(251,146,60,.85);color:#000}
+.clip-badge.active{background:rgba(74,222,128,.85);color:#000}
+.clip-card.to-delete{opacity:.6;border:2px solid var(--red)}
+.clip-card.to-delete .clip-thumb{filter:grayscale(.5)}
+.clip-objects{display:flex;flex-wrap:wrap;gap:3px;margin-top:4px}
+.obj-tag{font-size:9px;background:var(--card2);border:1px solid var(--border);padding:1px 5px;border-radius:8px;color:var(--accent)}
+.obj-tag.moving{border-color:var(--green);color:var(--green)}
+
+/* Insights Panel */
+.insights-panel{margin:16px 20px;background:var(--card);border-radius:12px;padding:18px 22px;display:none}
+.insights-panel.visible{display:block}
+.insights-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.insights-header h2{font-size:14px;font-weight:600;color:var(--accent)}
+.insights-toggle{background:var(--accent2);border:none;color:#fff;padding:5px 14px;border-radius:16px;font-size:11px;cursor:pointer;transition:background .15s}
+.insights-toggle:hover{background:var(--accent)}
+.insights-overall{font-size:13px;margin-bottom:12px;line-height:1.6;color:var(--text)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.stat-card{background:var(--card2);border-radius:8px;padding:10px 12px;text-align:center}
+.stat-num{font-size:22px;font-weight:700;color:var(--accent)}
+.stat-label{font-size:10px;color:var(--muted);margin-top:2px}
+.narrative-list{list-style:none;margin:0;padding:0}
+.narrative-list li{padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;color:var(--text)}
+.narrative-list li:last-child{border:none}
+.narrative-list li::before{content:'🔍 ';margin-right:4px}
+.track-table{width:100%;border-collapse:collapse;margin-top:12px;font-size:11px}
+.track-table th{text-align:left;padding:6px 8px;color:var(--muted);border-bottom:1px solid var(--border);font-weight:500}
+.track-table td{padding:5px 8px;border-bottom:1px solid rgba(37,42,56,.5)}
+.track-table tr:hover td{background:var(--card2)}
+.track-cls{display:inline-block;padding:1px 6px;border-radius:6px;font-weight:600}
+.track-cls.person{background:#4f8cff22;color:#4f8cff}
+.track-cls.car{background:#f8717122;color:#f87171}
+.track-cls.motorcycle{background:#facc1522;color:#facc15}
+.track-cls.cat{background:#a78bfa22;color:#a78bfa}
+.activity-bar{display:flex;align-items:end;gap:2px;height:40px;margin:12px 0}
+.bar-seg{flex:1;background:var(--accent);border-radius:2px 2px 0 0;min-height:2px;transition:height .3s;position:relative}
+.bar-seg:hover::after{content:attr(data-tip);position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--border);padding:3px 8px;border-radius:6px;font-size:9px;white-space:nowrap;color:var(--text)}
+
 /* Full-screen Player */
 .player-overlay{position:fixed;inset:0;background:rgba(0,0,0,.96);z-index:500;display:none;flex-direction:column}
 .player-overlay.visible{display:flex}
@@ -127,6 +166,26 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <span class="window-label" id="windowLabel">—</span>
     <span class="total-label" id="totalLabel"></span>
   </div>
+</div>
+
+<div style="margin:12px 20px 0;text-align:right">
+  <button class="insights-toggle" id="insightsBtn" onclick="toggleInsights()">🤖 AI Insights</button>
+</div>
+
+<div class="insights-panel" id="insightsPanel">
+  <div class="insights-header">
+    <h2>🧠 AI Scene Analysis</h2>
+  </div>
+  <div class="insights-overall" id="insightsOverall">Analyzing…</div>
+  <div class="stats-grid" id="insightsStats"></div>
+  <div class="activity-bar" id="activityBar"></div>
+  <h4 style="font-size:12px;color:var(--muted);margin:14px 0 8px">📖 Timeline Story</h4>
+  <ul class="narrative-list" id="narrativeList"></ul>
+  <h4 style="font-size:12px;color:var(--muted);margin:14px 0 8px">🔗 Cross-Clip Tracked Objects</h4>
+  <table class="track-table" id="trackTable">
+    <thead><tr><th>Object</th><th>Clips</th><th>Hits</th><th>Moving</th><th>Confidence</th></tr></thead>
+    <tbody id="trackBody"></tbody>
+  </table>
 </div>
 
 <div class="clips-section">
@@ -314,16 +373,30 @@ async function loadClips(){
     document.getElementById('clipsHeading').textContent=`${currentClips.length} clips in window`;
     document.getElementById('totalLabel').textContent=`${totalClips} total`;
     if(!currentClips.length){list.innerHTML='<div class="empty-state">No clips here — drag the window</div>';return;}
-    list.innerHTML=currentClips.map((c,i)=>`
-      <div class="clip-card" onclick="openClip(${i})" id="crow-${i}">
-        <img class="clip-thumb" src="${API}/media/clip/${c.id}/thumb" onerror="this.outerHTML='<div class=\\'clip-thumb-placeholder\\'>🎬</div>'">
-        <div class="clip-card-info">
-          <span class="clip-card-id">#${c.id}</span>
-          <div class="clip-card-time">${fmtTime(c.start_ts)}</div>
-          <div class="clip-card-meta">${c.duration_sec?c.duration_sec.toFixed(1)+'s':'~10s'} · ${c.sampled_frames||0} frames</div>
-        </div>
-      </div>
-    `).join('');
+    list.innerHTML=currentClips.map((c,i)=>{
+      const empty=!c.has_activity&&Object.keys(c.objects||{}).length===0;
+      const toDelete=c.local_path&&c.local_path.includes('to-be-deleted');
+      const cardCls=`clip-card${toDelete?' to-delete':''}`;
+      const badge=empty?'<span class="clip-badge empty">No Activity</span>':
+                  (c.has_activity?'<span class="clip-badge active">Active</span>':'');
+      const objs=Object.entries(c.objects||{}).map(([cls,cnt])=>{
+        const moving=(c.tracks||[]).some(t=>t.cls===cls&&t.moving);
+        return `<span class="obj-tag${moving?' moving'}">${cls}×${cnt}</span>`;
+      }).join('');
+      return `
+        <div class="${cardCls}" onclick="openClip(${i})" id="crow-${i}">
+          ${badge}
+          <img class="clip-thumb" src="${API}/media/clip/${c.id}/thumb" onerror="this.outerHTML='<div class=\\'clip-thumb-placeholder\\'>🎬</div>'">
+          <div class="clip-card-info">
+            <span class="clip-card-id">#${c.id}</span>
+            <div class="clip-card-time">${fmtTime(c.start_ts)}</div>
+            <div class="clip-card-meta">${c.duration_sec?c.duration_sec.toFixed(1)+'s':'~10s'} · ${c.sampled_frames||0} frames</div>
+            ${objs?'<div class="clip-objects">'+objs+'</div>':''}
+          </div>
+        </div>`;
+    }).join('');
+    // Load insights for same window
+    loadInsights(w.start,w.end);
   }catch(e){list.innerHTML='<div class="empty-state">Error loading clips</div>';}
 }
 
@@ -403,6 +476,81 @@ document.addEventListener('keydown',e=>{
     if(e.key==='Escape')closePlayer();
   }
 });
+
+// ─── Insights ───
+let insightsVisible=false;
+function toggleInsights(){
+  insightsVisible=!insightsVisible;
+  document.getElementById('insightsPanel').classList.toggle('visible',insightsVisible);
+  document.getElementById('insightsBtn').textContent=insightsVisible?'✕ Close Insights':'🤖 AI Insights';
+  if(insightsVisible){const w=getWindowTs();loadInsights(w.start,w.end);}
+}
+
+async function loadInsights(start,end){
+  if(!insightsVisible)return;
+  try{
+    const r=await fetch(`${API}/api/native/insights?start=${start}&end=${end}`);
+    const d=await r.json();
+
+    // Overall narrative
+    document.getElementById('insightsOverall').textContent=d.overall||'No data';
+
+    // Stats cards
+    const statsEl=document.getElementById('insightsStats');
+    const stats=[
+      {n:d.total_clips,l:'Total Clips'},
+      {n:d.active_clips,l:'With Objects'},
+      {n:d.empty_clips,l:'Empty (Delete?)'},
+      {n:d.class_stats?.length||0,l:'Object Types'},
+    ];
+    // Add per-class stats
+    (d.class_stats||[]).forEach(s=>stats.push({n:s.tracks,l:s.cls+' tracks'}));
+    statsEl.innerHTML=stats.map(s=>`<div class="stat-card"><div class="stat-num">${s.n}</div><div class="stat-label">${s.l}</div></div>`).join('');
+
+    // Activity bar
+    const barEl=document.getElementById('activityBar');
+    const timeline=d.activity_timeline||[];
+    if(timeline.length){
+      const maxObj=Math.max(...timeline.map(b=>b.unique_objects),1);
+      barEl.innerHTML=timeline.map(b=>{
+        const h=Math.max(4,Math.round((b.unique_objects/maxObj)*36));
+        const t=new Date(b.start_ts*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',hour12:true});
+        const top=Object.entries(b.top_classes).map(([c,n])=>`${n}×${c}`).join(', ');
+        return `<div class="bar-seg" style="height:${h}px" data-tip="${t}: ${top||'none'}"></div>`;
+      }).join('');
+    }else{barEl.innerHTML='<span style="color:var(--muted);font-size:11px">No activity data</span>';}
+
+    // Narratives
+    const narEl=document.getElementById('narrativeList');
+    const narr=d.narratives||[];
+    if(narr.length){
+      narEl.innerHTML=narr.map(n=>`<li>${n}</li>`).join('');
+    }else{
+      narEl.innerHTML='<li style="color:var(--muted)">No movement detected in this window</li>';
+    }
+
+    // Cross-clip tracks table
+    const tbody=document.getElementById('trackBody');
+    const tracks=d.cross_clip_tracks||[];
+    if(tracks.length){
+      tbody.innerHTML=tracks.map(t=>{
+        const span=t.last_ts-t.first_ts;
+        const spanStr=span>60?`${Math.round(span/60)}m`:`${Math.round(span)}s`;
+        return `<tr>
+          <td><span class="track-cls ${t.cls}">${t.cls}</span></td>
+          <td>#${t.first_clip}→#${t.last_clip} (${spanStr})</td>
+          <td>${t.hits} frames</td>
+          <td>${t.moving?'🟢 Yes':'⚪ Static'}</td>
+          <td>${(t.confidence*100).toFixed(0)}%</td>
+        </tr>`;
+      }).join('');
+    }else{
+      tbody.innerHTML='<tr><td colspan="5" style="color:var(--muted)">No tracked objects in window</td></tr>';
+    }
+  }catch(e){
+    document.getElementById('insightsOverall').textContent='Error loading insights: '+e.message;
+  }
+}
 
 init();
 // Auto-refresh every 30s
