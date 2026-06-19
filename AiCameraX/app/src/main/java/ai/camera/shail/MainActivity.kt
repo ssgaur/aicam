@@ -77,7 +77,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-private const val DEFAULT_BACKEND = "http://localhost:8100"
+private const val DEFAULT_BACKEND = "https://20.197.31.88:8100"
 
 class MainActivity : ComponentActivity() {
     private var previewView: PreviewView? = null
@@ -88,6 +88,18 @@ class MainActivity : ComponentActivity() {
         .connectTimeout(10, TimeUnit.SECONDS)
         .writeTimeout(3, TimeUnit.MINUTES)
         .readTimeout(3, TimeUnit.MINUTES)
+        .apply {
+            // Trust self-signed certs (private AiCam server)
+            val trustAll = object : javax.net.ssl.X509TrustManager {
+                override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
+                override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+            }
+            val sslContext = javax.net.ssl.SSLContext.getInstance("TLS")
+            sslContext.init(null, arrayOf(trustAll), java.security.SecureRandom())
+            sslSocketFactory(sslContext.socketFactory, trustAll)
+            hostnameVerifier { _, _ -> true }
+        }
         .build()
 
     private var hasCameraPermission by mutableStateOf(false)
@@ -343,16 +355,21 @@ class MainActivity : ComponentActivity() {
                 try {
                     val seconds = chunkSecondsText.toIntOrNull()?.coerceIn(3, 300) ?: 10
                     val file = recordChunk(current, seconds)
-                    statusText = "Uploading #$current"
-                    val ok = uploadClip(file, current)
-                    if (ok) {
-                        uploadedCount += 1
-                        file.delete()
-                        statusText = "Uploaded #$current"
-                    } else {
-                        errorCount += 1
-                        statusText = "Upload failed #$current"
+                    // Upload in background — don't block next recording
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val ok = uploadClip(file, current)
+                            if (ok) {
+                                uploadedCount += 1
+                                file.delete()
+                            } else {
+                                errorCount += 1
+                            }
+                        } catch (_: Exception) {
+                            errorCount += 1
+                        }
                     }
+                    statusText = "REC #${current + 1} (uploading #$current)"
                 } catch (e: CancellationException) {
                     isRecording = false
                     statusText = "Stopped"
@@ -362,7 +379,7 @@ class MainActivity : ComponentActivity() {
                     statusText = "Chunk #$current error: ${e.message}"
                     delay(1500)
                 }
-                delay(250)
+                delay(100)
             }
         }
     }
