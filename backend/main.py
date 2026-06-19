@@ -695,12 +695,110 @@ def api_native_summary(since: str = "10m"):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
+@app.get("/api/native/clips")
+def api_native_clips(start: float = 0, end: float = 0):
+    """List clips whose time overlaps a given range. Returns clip metadata + frame paths."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    if end <= 0:
+        end = time.time()
+    if start <= 0:
+        start = end - 3600
+    rows = con.execute(
+        """
+        SELECT id, start_ts, end_ts, start_iso, end_iso,
+               local_path, frames_dir, duration_sec, sampled_frames, status
+        FROM clips
+        WHERE end_ts >= ? AND start_ts <= ?
+        ORDER BY start_ts
+        """,
+        (start, end),
+    ).fetchall()
+    clips = []
+    for r in rows:
+        clips.append({
+            "id": r[0], "start_ts": r[1], "end_ts": r[2],
+            "start_iso": r[3], "end_iso": r[4],
+            "local_path": r[5], "frames_dir": r[6],
+            "duration_sec": r[7], "sampled_frames": r[8], "status": r[9],
+        })
+    con.close()
+    return {"start": start, "end": end, "count": len(clips), "clips": clips}
+
+
+@app.get("/api/native/clips/{clip_id}/frames")
+def api_native_clip_frames(clip_id: int):
+    """Return frame paths for a specific clip."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    rows = con.execute(
+        "SELECT id, frame_index, video_time_sec, abs_ts, iso, path FROM sampled_frames WHERE clip_id=? ORDER BY frame_index",
+        (clip_id,),
+    ).fetchall()
+    con.close()
+    return {
+        "clip_id": clip_id,
+        "count": len(rows),
+        "frames": [
+            {"id": r[0], "frame_index": r[1], "video_time_sec": r[2], "abs_ts": r[3], "iso": r[4], "path": r[5]}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/native/clips/range")
+def api_native_clips_range():
+    """Return the min/max timestamps of all clips — for the timeline widget."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    row = con.execute("SELECT MIN(start_ts), MAX(end_ts), COUNT(*) FROM clips").fetchone()
+    con.close()
+    return {"min_ts": row[0], "max_ts": row[1], "total_clips": row[2]}
+
+
+from fastapi.responses import FileResponse as _FR  # noqa: E402
+
+
+@app.get("/media/clip/{clip_id}")
+def serve_clip(clip_id: int):
+    """Serve an mp4 clip by ID."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    row = con.execute("SELECT local_path FROM clips WHERE id=?", (clip_id,)).fetchone()
+    con.close()
+    if not row or not row[0] or not Path(row[0]).exists():
+        return JSONResponse({"error": "clip not found"}, status_code=404)
+    return _FR(row[0], media_type="video/mp4")
+
+
+@app.get("/media/frame/{frame_id}")
+def serve_frame(frame_id: int):
+    """Serve a sampled frame JPEG by ID."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    row = con.execute("SELECT path FROM sampled_frames WHERE id=?", (frame_id,)).fetchone()
+    con.close()
+    if not row or not row[0] or not Path(row[0]).exists():
+        return JSONResponse({"error": "frame not found"}, status_code=404)
+    return _FR(row[0], media_type="image/jpeg")
+
+
 @app.get("/snap/latest.jpg")
 def snap_latest():
     p = DATA / "latest.jpg"
     if not p.exists():
         return JSONResponse({"empty": True}, status_code=404)
     return FileResponse(p)
+
+
+@app.get("/viewer")
+def viewer_page():
+    """Single-page clip/frame timeline browser."""
+    from fastapi.responses import HTMLResponse
+    html_path = ROOT / "viewer.html"
+    if html_path.exists():
+        return HTMLResponse(html_path.read_text())
+    return HTMLResponse("<h1>viewer.html not found at repo root</h1>", status_code=404)
 
 
 @app.get("/api/counts")
