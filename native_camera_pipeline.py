@@ -34,6 +34,9 @@ DATA = Path(os.getenv("AICAM_NATIVE_DATA", str(ROOT / "data" / "native_camera"))
 CLIPS = DATA / "clips"
 FRAMES = DATA / "frames"
 AUDITS = DATA / "audits"
+TO_BE_DELETED = DATA / "to-be-deleted"
+TO_BE_DELETED_CLIPS = TO_BE_DELETED / "clips"
+TO_BE_DELETED_FRAMES = TO_BE_DELETED / "frames"
 DB_PATH = DATA / "native_camera.db"
 YOLO_MODEL = ROOT / "checkpoints" / "yolov8n.pt"
 
@@ -280,6 +283,8 @@ def init_db() -> None:
     CLIPS.mkdir(parents=True, exist_ok=True)
     FRAMES.mkdir(parents=True, exist_ok=True)
     AUDITS.mkdir(parents=True, exist_ok=True)
+    TO_BE_DELETED_CLIPS.mkdir(parents=True, exist_ok=True)
+    TO_BE_DELETED_FRAMES.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.executescript(
         """
@@ -603,6 +608,44 @@ def run_yolo(model: YOLO, device: str, frame: np.ndarray, conf: float) -> list[d
     return detections
 
 
+def unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    for index in range(1, 10_000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find unique destination for {path}")
+
+
+def maybe_quarantine_empty_clip(con: sqlite3.Connection, clip_id: int, local_path: Path, frames_dir: Path) -> None:
+    detection_count = con.execute("SELECT COUNT(*) FROM detections WHERE clip_id=?", (clip_id,)).fetchone()[0]
+    if detection_count > 0:
+        return
+    if not local_path.exists():
+        return
+
+    TO_BE_DELETED_CLIPS.mkdir(parents=True, exist_ok=True)
+    TO_BE_DELETED_FRAMES.mkdir(parents=True, exist_ok=True)
+    new_clip_path = unique_destination(TO_BE_DELETED_CLIPS / local_path.name)
+    shutil.move(str(local_path), str(new_clip_path))
+
+    new_frames_dir = frames_dir
+    if frames_dir.exists():
+        new_frames_dir = unique_destination(TO_BE_DELETED_FRAMES / frames_dir.name)
+        shutil.move(str(frames_dir), str(new_frames_dir))
+        con.execute(
+            "UPDATE sampled_frames SET path = REPLACE(path, ?, ?) WHERE clip_id=?",
+            (str(frames_dir), str(new_frames_dir), clip_id),
+        )
+
+    con.execute(
+        "UPDATE clips SET local_path=?, frames_dir=? WHERE id=?",
+        (str(new_clip_path), str(new_frames_dir), clip_id),
+    )
+
+
 def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker, sample_fps: float, conf: float) -> None:
     con = sqlite3.connect(DB_PATH)
     try:
@@ -673,6 +716,7 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
             """,
             (duration, video_fps, sample_fps, sampled_count, job.clip_id),
         )
+        maybe_quarantine_empty_clip(con, job.clip_id, job.local_path, job.frames_dir)
         con.commit()
     except Exception as exc:
         con.execute("UPDATE clips SET status='error', error=? WHERE id=?", (str(exc), job.clip_id))
@@ -1230,6 +1274,7 @@ def doctor() -> None:
     print(f"clips_dir={CLIPS}")
     print(f"frames_dir={FRAMES}")
     print(f"audits_dir={AUDITS}")
+    print(f"to_be_deleted_dir={TO_BE_DELETED}")
     print(f"db={DB_PATH}")
     print(f"db_exists={DB_PATH.exists()}")
     print(f"yolo_model={YOLO_MODEL}")
@@ -1241,6 +1286,7 @@ def doctor() -> None:
         print(f"adb_device=error: {exc}")
     print(f"mp4_count={len(list(CLIPS.glob('*.mp4'))) if CLIPS.exists() else 0}")
     print(f"jpg_count={len(list(FRAMES.rglob('*.jpg'))) if FRAMES.exists() else 0}")
+    print(f"to_be_deleted_mp4_count={len(list(TO_BE_DELETED_CLIPS.glob('*.mp4'))) if TO_BE_DELETED_CLIPS.exists() else 0}")
 
 
 def main() -> int:
