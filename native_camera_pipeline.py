@@ -718,6 +718,12 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
         )
         maybe_quarantine_empty_clip(con, job.clip_id, job.local_path, job.frames_dir)
         con.commit()
+        try:
+            import postgres_store
+
+            postgres_store.sync_clip(DB_PATH, job.clip_id)
+        except Exception as pg_exc:
+            print(f"[postgres-sync] clip_id={job.clip_id} error={pg_exc}")
     except Exception as exc:
         con.execute("UPDATE clips SET status='error', error=? WHERE id=?", (str(exc), job.clip_id))
         con.commit()

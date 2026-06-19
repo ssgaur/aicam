@@ -684,6 +684,17 @@ def api_native_status():
     return status
 
 
+@app.get("/api/native/summary")
+def api_native_summary(since: str = "10m"):
+    """Postgres-backed durable summary; survives MP4/JPG cleanup."""
+    try:
+        import postgres_store
+
+        return postgres_store.summary_data(since)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.get("/snap/latest.jpg")
 def snap_latest():
     p = DATA / "latest.jpg"

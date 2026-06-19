@@ -1,10 +1,34 @@
-# AiCam — Live AI camera with SAM 2
+# AiCam — Local AI camera
+
+AiCam turns an Android phone into a local AI camera. The recommended path is the
+native **AI CameraX** Android app plus the local FastAPI backend.
+
+```text
+Android CameraX app
+→ records MP4 chunks
+→ uploads to laptop backend over local LAN
+→ deletes temp phone clip after upload
+→ laptop samples frames
+→ local YOLO counts people/cars/bikes/dogs
+→ SQLite/Postgres store results
+```
+
+**Copilot is not needed to run this. Internet is not needed after setup.**
+
+Start here:
+
+```text
+docs/AI_CAM_BEGINNER_GUIDE.md
+```
 
 Phone (Flutter) streams JPEG frames over WebSocket → Mac backend runs **SAM 2 Hiera-Tiny** (auto mask generator) on MPS → returns colored mask overlay → phone composites on live preview.
 
 ## Architecture
-- **app/** — Flutter app (Android primary). Camera preview + WebSocket client.
+- **AiCameraX/** — native Android CameraX app, recommended product path.
+- **app/** — older Flutter prototype. Camera preview + WebSocket client.
 - **backend/** — FastAPI + sam2 + PyTorch (MPS on Mac, CUDA in cloud).
+- **native_camera_pipeline.py** — local YOLO sampling/tracking/SQLite logic.
+- **postgres_store.py** — Postgres durable metadata sync and summary queries.
 - **checkpoints/** — `sam2.1_hiera_tiny.pt` (~149 MB, gitignored). Download:
   ```
   curl -L -o checkpoints/sam2.1_hiera_tiny.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
@@ -64,6 +88,13 @@ inside the Android app and uploads them to the Mac backend. This avoids ADB
 record/stop tapping.
 
 See [`docs/CAMERAX_AI_CAM.md`](docs/CAMERAX_AI_CAM.md).
+
+Durable object metadata can be stored in local Postgres:
+
+```bash
+python postgres_store.py sync
+python postgres_store.py summary --since 10m
+```
 
 ## TODO
 - Tap-to-track mode (SAM 2 video predictor with memory bank).
