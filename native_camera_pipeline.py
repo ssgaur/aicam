@@ -390,6 +390,27 @@ def init_db() -> None:
     con.close()
 
 
+def _time_subdir(ts: float) -> Path:
+    """Return year/month/Www/day/hour/minute relative subdir for a clip start ts.
+
+    The leaf "minute" folder holds ~6 ten-second clips and their frames.
+    """
+    dt = datetime.fromtimestamp(ts)
+    year, week, _ = dt.isocalendar()
+    return Path(f"{dt.year:04d}") / f"{dt.month:02d}" / f"W{week:02d}" / \
+        f"{dt.day:02d}" / f"{dt.hour:02d}" / f"{dt.minute:02d}"
+
+
+def clip_path_for(clip_id: int, start_ts: float) -> Path:
+    stamp = datetime.fromtimestamp(start_ts).strftime("%Y%m%d-%H%M%S")
+    return CLIPS / _time_subdir(start_ts) / f"clip_{clip_id:06d}_{stamp}.mp4"
+
+
+def frames_dir_for(clip_id: int, start_ts: float) -> Path:
+    stamp = datetime.fromtimestamp(start_ts).strftime("%Y%m%d-%H%M%S")
+    return FRAMES / _time_subdir(start_ts) / f"clip_{clip_id:06d}_{stamp}"
+
+
 def create_clip(start_ts: float, end_ts: float) -> tuple[int, Path, Path]:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -403,9 +424,9 @@ def create_clip(start_ts: float, end_ts: float) -> tuple[int, Path, Path]:
     clip_id = int(cur.lastrowid)
     con.commit()
     con.close()
-    stamp = datetime.fromtimestamp(start_ts).strftime("%Y%m%d-%H%M%S")
-    local_path = CLIPS / f"clip_{clip_id:06d}_{stamp}.mp4"
-    frames_dir = FRAMES / f"clip_{clip_id:06d}_{stamp}"
+    local_path = clip_path_for(clip_id, start_ts)
+    frames_dir = frames_dir_for(clip_id, start_ts)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
     return clip_id, local_path, frames_dir
 
 
@@ -659,14 +680,17 @@ def maybe_quarantine_empty_clip(con: sqlite3.Connection, clip_id: int, local_pat
     if not local_path.exists():
         return
 
-    TO_BE_DELETED_CLIPS.mkdir(parents=True, exist_ok=True)
-    TO_BE_DELETED_FRAMES.mkdir(parents=True, exist_ok=True)
-    new_clip_path = unique_destination(TO_BE_DELETED_CLIPS / local_path.name)
+    # Mirror the time-bucketed subdir under to-be-deleted/clips and to-be-deleted/frames.
+    rel_clip = _relative_to_or_none(local_path, CLIPS) or Path(local_path.name)
+    new_clip_path = unique_destination(TO_BE_DELETED_CLIPS / rel_clip)
+    new_clip_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(local_path), str(new_clip_path))
 
     new_frames_dir = frames_dir
     if frames_dir.exists():
-        new_frames_dir = unique_destination(TO_BE_DELETED_FRAMES / frames_dir.name)
+        rel_frames = _relative_to_or_none(frames_dir, FRAMES) or Path(frames_dir.name)
+        new_frames_dir = unique_destination(TO_BE_DELETED_FRAMES / rel_frames)
+        new_frames_dir.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(frames_dir), str(new_frames_dir))
         con.execute(
             "UPDATE sampled_frames SET path = REPLACE(path, ?, ?) WHERE clip_id=?",
@@ -677,6 +701,13 @@ def maybe_quarantine_empty_clip(con: sqlite3.Connection, clip_id: int, local_pat
         "UPDATE clips SET local_path=?, frames_dir=? WHERE id=?",
         (str(new_clip_path), str(new_frames_dir), clip_id),
     )
+
+
+def _relative_to_or_none(p: Path, base: Path) -> Path | None:
+    try:
+        return p.relative_to(base)
+    except ValueError:
+        return None
 
 
 def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker, sample_fps: float, conf: float) -> None:
