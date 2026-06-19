@@ -257,7 +257,7 @@ def _requeue_unprocessed_clips():
                     local_path=Path(local_path),
                     frames_dir=Path(frames_dir) if frames_dir else Path(local_path).parent / "frames",
                 ),
-                "sample_fps": 2.0,
+                "sample_fps": 1.0,
                 "conf": 0.35,
             })
         else:
@@ -666,7 +666,7 @@ async def api_native_upload(
     file: UploadFile = File(...),
     start_ts: float = Form(...),
     end_ts: float = Form(...),
-    sample_fps: float = Form(2.0),
+    sample_fps: float = Form(1.0),
     conf: float = Form(0.35),
     chunk_index: int = Form(0),
     device_id: str = Form("android"),

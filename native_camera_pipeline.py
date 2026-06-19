@@ -809,6 +809,18 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
             postgres_store.sync_clip(DB_PATH, job.clip_id)
         except Exception as pg_exc:
             print(f"[postgres-sync] clip_id={job.clip_id} error={pg_exc}")
+
+        # Cloud mode: auto-delete files after processing to save disk
+        if os.environ.get("AICAM_CLOUD") == "1":
+            try:
+                if job.local_path.exists():
+                    job.local_path.unlink()
+                if job.frames_dir.exists():
+                    import shutil
+                    shutil.rmtree(job.frames_dir)
+                _plog(f"    🗑️  cloud cleanup: deleted clip+frames from disk")
+            except Exception as cleanup_exc:
+                _plog(f"    ⚠️  cleanup error: {cleanup_exc}")
     except Exception as exc:
         con.execute("UPDATE clips SET status='error', error=? WHERE id=?", (str(exc), job.clip_id))
         con.commit()
