@@ -278,6 +278,38 @@ def delete_phone_video(phone_path: str) -> bool:
     return proc.returncode == 0
 
 
+def seed_sqlite_sequences_from_postgres(con: sqlite3.Connection) -> None:
+    """Keep fresh SQLite IDs above durable Postgres IDs after data/native_camera deletion."""
+    local_counts = {
+        table: con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("clips", "sampled_frames", "detections", "object_tracks")
+    }
+    if any(count > 0 for count in local_counts.values()):
+        return
+    try:
+        import postgres_store
+
+        postgres_store.ensure_schema()
+        with postgres_store.connect() as pg:
+            max_ids = {
+                "clips": pg.execute("SELECT COALESCE(MAX(id), 0) FROM native_clips").fetchone()[0],
+                "sampled_frames": pg.execute("SELECT COALESCE(MAX(id), 0) FROM native_sampled_frames").fetchone()[0],
+                "detections": pg.execute("SELECT COALESCE(MAX(id), 0) FROM native_detections").fetchone()[0],
+                "object_tracks": pg.execute("SELECT COALESCE(MAX(id), 0) FROM native_object_tracks").fetchone()[0],
+            }
+    except Exception as exc:
+        print(f"[sqlite-seed] postgres unavailable, starting local ids normally: {exc}")
+        return
+
+    for table, max_id in max_ids.items():
+        if max_id and max_id > 0:
+            cur = con.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?", (int(max_id), table))
+            if cur.rowcount == 0:
+                con.execute("INSERT INTO sqlite_sequence(name, seq) VALUES(?, ?)", (table, int(max_id)))
+    if any(max_id > 0 for max_id in max_ids.values()):
+        print(f"[sqlite-seed] seeded sqlite ids from postgres max ids: {max_ids}")
+
+
 def init_db() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     CLIPS.mkdir(parents=True, exist_ok=True)
@@ -353,6 +385,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_native_tracks_category_last ON object_tracks(category, last_ts);
         """
     )
+    seed_sqlite_sequences_from_postgres(con)
     con.commit()
     con.close()
 
