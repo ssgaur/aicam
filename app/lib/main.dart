@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -46,6 +47,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _camReady = false;
   bool? _pingOk;
   bool _streaming = false;
+  bool _chunking = false;
+  bool _chunkRecording = false;
   WebSocketChannel? _ws;
   Uint8List? _overlay;
   int _fps = 0;
@@ -56,6 +59,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _busy = false;
   bool _scanning = false;
   String _status = '';
+  String _chunkStatus = '';
+  int _chunkIndex = 0;
+  int _chunksUploaded = 0;
+  int _chunkErrors = 0;
+  final TextEditingController _chunkSecondsCtl = TextEditingController(text: '10');
+  final TextEditingController _sampleFpsCtl = TextEditingController(text: '2');
   final FlutterTts _tts = FlutterTts();
   int _lastSayId = 0;
   Timer? _sayTimer;
@@ -197,7 +206,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => _cameras.first,
     );
-    final c = CameraController(back, ResolutionPreset.medium, enableAudio: false, imageFormatGroup: ImageFormatGroup.jpeg);
+    final c = CameraController(back, ResolutionPreset.high, enableAudio: false, imageFormatGroup: ImageFormatGroup.jpeg);
     await c.initialize();
     if (!mounted) return;
     setState(() {
@@ -212,8 +221,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _sayTimer?.cancel();
     _tts.stop();
     _stopStream();
+    _stopChunking();
     _cam?.dispose();
     _backendCtl.dispose();
+    _chunkSecondsCtl.dispose();
+    _sampleFpsCtl.dispose();
     super.dispose();
   }
 
@@ -234,6 +246,131 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await _stopStream();
     } else {
       await _startStream();
+    }
+  }
+
+  Future<void> _toggleChunking() async {
+    if (_chunking) {
+      await _stopChunking();
+    } else {
+      await _startChunking();
+    }
+  }
+
+  Future<void> _startChunking() async {
+    if (!_camReady || _cam == null || _chunking) return;
+    if (_streaming) await _stopStream();
+    if (_cam!.value.isTakingPicture || _cam!.value.isRecordingVideo) {
+      setState(() => _chunkStatus = 'Camera busy');
+      return;
+    }
+    setState(() {
+      _chunking = true;
+      _chunkStatus = 'Starting chunks…';
+      _chunkIndex = 0;
+      _chunksUploaded = 0;
+      _chunkErrors = 0;
+    });
+    unawaited(_chunkLoop());
+  }
+
+  Future<void> _stopChunking() async {
+    if (!_chunking && !_chunkRecording) return;
+    setState(() {
+      _chunking = false;
+      _chunkStatus = _chunkRecording ? 'Stopping after current chunk…' : 'Stopped';
+    });
+  }
+
+  int _chunkSeconds() {
+    final parsed = int.tryParse(_chunkSecondsCtl.text.trim()) ?? 10;
+    return parsed.clamp(3, 300).toInt();
+  }
+
+  double _sampleFps() {
+    final parsed = double.tryParse(_sampleFpsCtl.text.trim()) ?? 2.0;
+    return parsed.clamp(0.2, 10.0).toDouble();
+  }
+
+  Future<void> _chunkLoop() async {
+    while (_chunking && mounted && _cam != null) {
+      final chunkNo = _chunkIndex + 1;
+      final seconds = _chunkSeconds();
+      XFile? recorded;
+      late DateTime started;
+      late DateTime stopped;
+      try {
+        try {
+          await _cam!.prepareForVideoRecording();
+        } catch (_) {}
+        started = DateTime.now();
+        await _cam!.startVideoRecording();
+        _chunkRecording = true;
+        if (mounted) {
+          setState(() {
+            _chunkIndex = chunkNo;
+            _chunkStatus = 'Recording chunk #$chunkNo (${seconds}s)…';
+          });
+        }
+
+        final deadline = started.add(Duration(seconds: seconds));
+        while (_chunking && DateTime.now().isBefore(deadline)) {
+          await Future.delayed(const Duration(milliseconds: 250));
+        }
+
+        recorded = await _cam!.stopVideoRecording();
+        stopped = DateTime.now();
+        _chunkRecording = false;
+        if (mounted) setState(() => _chunkStatus = 'Uploading chunk #$chunkNo…');
+      } catch (e) {
+        _chunkRecording = false;
+        _chunkErrors++;
+        if (mounted) setState(() => _chunkStatus = 'Chunk #$chunkNo error: $e');
+        try {
+          if (_cam?.value.isRecordingVideo == true) {
+            await _cam!.stopVideoRecording();
+          }
+        } catch (_) {}
+        await Future.delayed(const Duration(seconds: 2));
+        continue;
+      }
+
+      unawaited(_uploadNativeClip(recorded, started, stopped, chunkNo));
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    if (mounted) {
+      setState(() {
+        _chunking = false;
+        _chunkRecording = false;
+        if (!_chunkStatus.startsWith('Chunk')) _chunkStatus = 'Stopped';
+      });
+    }
+  }
+
+  Future<void> _uploadNativeClip(XFile clip, DateTime started, DateTime stopped, int chunkNo) async {
+    try {
+      final uri = Uri.parse('${_backendCtl.text}/api/native/upload');
+      final req = http.MultipartRequest('POST', uri);
+      req.fields['start_ts'] = (started.millisecondsSinceEpoch / 1000.0).toStringAsFixed(3);
+      req.fields['end_ts'] = (stopped.millisecondsSinceEpoch / 1000.0).toStringAsFixed(3);
+      req.fields['sample_fps'] = _sampleFps().toString();
+      req.fields['conf'] = '0.35';
+      req.fields['chunk_index'] = chunkNo.toString();
+      req.fields['device_id'] = 'flutter-camerax';
+      req.files.add(await http.MultipartFile.fromPath('file', clip.path, filename: 'aicam_chunk_$chunkNo.mp4'));
+      final streamed = await req.send().timeout(const Duration(minutes: 3));
+      final body = await streamed.stream.bytesToString();
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+        throw Exception('HTTP ${streamed.statusCode}: $body');
+      }
+      _chunksUploaded++;
+      try {
+        await File(clip.path).delete();
+      } catch (_) {}
+      if (mounted) setState(() => _chunkStatus = 'Uploaded chunk #$chunkNo ($_chunksUploaded ok, $_chunkErrors errors)');
+    } catch (e) {
+      _chunkErrors++;
+      if (mounted) setState(() => _chunkStatus = 'Upload #$chunkNo failed: $e');
     }
   }
 
@@ -415,17 +552,64 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
           Padding(
             padding: const EdgeInsets.all(12),
-            child: SizedBox(
-              width: double.infinity,
-              height: 56,
-              child: FilledButton.icon(
-                onPressed: _camReady ? _toggleStream : null,
-                icon: Icon(_streaming ? Icons.stop : Icons.play_arrow),
-                label: Text(_streaming ? 'Stop' : 'Start Live Segmentation'),
-                style: FilledButton.styleFrom(
-                  backgroundColor: _streaming ? Colors.red : null,
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _chunkSecondsCtl,
+                        keyboardType: TextInputType.number,
+                        enabled: !_chunking,
+                        decoration: const InputDecoration(labelText: 'Chunk sec', isDense: true, border: OutlineInputBorder()),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _sampleFpsCtl,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                        enabled: !_chunking,
+                        decoration: const InputDecoration(labelText: 'Sample FPS', isDense: true, border: OutlineInputBorder()),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: FilledButton.icon(
+                    onPressed: _camReady ? _toggleChunking : null,
+                    icon: Icon(_chunking ? Icons.stop_circle : Icons.videocam),
+                    label: Text(_chunking ? 'Stop Real AI Cam' : 'Start Real AI Cam'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _chunking ? Colors.red : Colors.green,
+                    ),
+                  ),
+                ),
+                if (_chunkStatus.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(_chunkStatus, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: FilledButton.icon(
+                    onPressed: (_camReady && !_chunking) ? _toggleStream : null,
+                    icon: Icon(_streaming ? Icons.stop : Icons.play_arrow),
+                    label: Text(_streaming ? 'Stop' : 'Start Live Segmentation'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _streaming ? Colors.red : null,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
         ],

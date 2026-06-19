@@ -5,7 +5,11 @@ import io
 import json
 import math
 import os
+import queue
+import shutil
 import sqlite3
+import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from PIL import Image, ImageDraw, ImageFont
@@ -26,6 +30,10 @@ DATA = ROOT / "data"
 SNAPS = DATA / "snaps"
 DB_PATH = DATA / "events.db"
 SNAPS.mkdir(parents=True, exist_ok=True)
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+import native_camera_pipeline as native_cam  # noqa: E402
 
 CAPTION_EVERY_SEC = 3.0  # ~$2-3/day at 1 FPS, well under $10
 SAM_MAX_SIDE = 320
@@ -55,6 +63,9 @@ _state = {"sam": None, "yolo": None, "device": None,
           "last_caption_ts": 0.0, "caption_inflight": False,
           "last_process_ts": 0.0, "process_inflight": False,
           "tracks": []}
+
+_native_upload_queue: "queue.Queue[dict | None]" = queue.Queue()
+_native_upload_worker: threading.Thread | None = None
 
 # 1x1 transparent PNG for "no overlay" replies to phone
 _EMPTY_PNG = (
@@ -179,11 +190,42 @@ def _load_active_tracks():
     print(f"[init] active tracks loaded={len(_state['tracks'])}")
 
 
+def _native_upload_loop():
+    """Background processor for MP4 chunks uploaded by the Android app."""
+    native_cam.init_db()
+    model, device = native_cam.load_model()
+    tracker = native_cam.GlobalTracker()
+    print("[native-upload] worker ready")
+    while True:
+        item = _native_upload_queue.get()
+        if item is None:
+            _native_upload_queue.task_done()
+            break
+        job = item["job"]
+        try:
+            native_cam.process_clip(job, model, device, tracker, item["sample_fps"], item["conf"])
+            print(f"[native-upload] processed clip_id={job.clip_id}")
+        except Exception as exc:
+            native_cam.mark_clip_error(job.clip_id, str(exc))
+            print(f"[native-upload] clip_id={job.clip_id} error={exc}")
+        finally:
+            _native_upload_queue.task_done()
+
+
+def _ensure_native_upload_worker():
+    global _native_upload_worker
+    if _native_upload_worker is not None and _native_upload_worker.is_alive():
+        return
+    _native_upload_worker = threading.Thread(target=_native_upload_loop, name="native-upload-worker", daemon=True)
+    _native_upload_worker.start()
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _init_db()
     _load_active_tracks()
     _load_models()
+    native_cam.init_db()
     yield
 
 
@@ -581,6 +623,65 @@ def api_latest():
     if not row:
         return JSONResponse({"empty": True})
     return {"ts": row[0], "iso": row[1], "path": row[2], "yolo": json.loads(row[3] or "{}"), "caption": row[4]}
+
+
+@app.post("/api/native/upload")
+async def api_native_upload(
+    file: UploadFile = File(...),
+    start_ts: float = Form(...),
+    end_ts: float = Form(...),
+    sample_fps: float = Form(2.0),
+    conf: float = Form(0.35),
+    chunk_index: int = Form(0),
+    device_id: str = Form("android"),
+):
+    """Accept one CameraX/Flutter MP4 chunk and process it with the native-camera pipeline."""
+    native_cam.init_db()
+    if end_ts <= start_ts:
+        return JSONResponse({"ok": False, "error": "end_ts must be greater than start_ts"}, status_code=400)
+    clip_id, local_path, frames_dir = native_cam.create_clip(start_ts, end_ts)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with local_path.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+    finally:
+        await file.close()
+
+    if not native_cam.local_video_ok(local_path):
+        native_cam.mark_clip_error(clip_id, "uploaded MP4 is not playable")
+        return JSONResponse(
+            {"ok": False, "clip_id": clip_id, "error": "uploaded MP4 is not playable", "local_path": str(local_path)},
+            status_code=400,
+        )
+
+    phone_path = f"android-upload:{device_id}:{chunk_index}:{file.filename or local_path.name}"
+    native_cam.mark_clip_pulled(clip_id, phone_path, local_path, frames_dir)
+    _ensure_native_upload_worker()
+    _native_upload_queue.put(
+        {
+            "job": native_cam.ClipJob(clip_id=clip_id, phone_path=phone_path, local_path=local_path, frames_dir=frames_dir),
+            "sample_fps": sample_fps,
+            "conf": conf,
+        }
+    )
+    return {
+        "ok": True,
+        "accepted": True,
+        "clip_id": clip_id,
+        "chunk_index": chunk_index,
+        "local_path": str(local_path),
+        "frames_dir": str(frames_dir),
+        "queue_depth": _native_upload_queue.qsize(),
+    }
+
+
+@app.get("/api/native/status")
+def api_native_status():
+    native_cam.init_db()
+    status = native_cam.latest_status()
+    status["queue_depth"] = _native_upload_queue.qsize()
+    status["worker_alive"] = bool(_native_upload_worker and _native_upload_worker.is_alive())
+    return status
 
 
 @app.get("/snap/latest.jpg")

@@ -57,6 +57,14 @@ runs locally. It does not call Azure/OpenAI/Copilot.
 See [`docs/NATIVE_CAMERA_PIPELINE.md`](docs/NATIVE_CAMERA_PIPELINE.md) for the
 full tomorrow runbook, storage estimates, and troubleshooting notes.
 
+## CameraX real AI cam branch
+
+The app also has a **Start Real AI Cam** mode that records MP4 chunks directly
+inside the Android app and uploads them to the Mac backend. This avoids ADB
+record/stop tapping.
+
+See [`docs/CAMERAX_AI_CAM.md`](docs/CAMERAX_AI_CAM.md).
+
 ## TODO
 - Tap-to-track mode (SAM 2 video predictor with memory bank).
 - Send RLE masks instead of PNG (smaller, faster).
