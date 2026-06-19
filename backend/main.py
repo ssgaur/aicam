@@ -137,23 +137,28 @@ def _init_db():
 
 
 def _load_models():
-    from sam2.build_sam import build_sam2
-    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-    from ultralytics import YOLO
+    try:
+        from sam2.build_sam import build_sam2
+        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        dev = _device()
+        print(f"[init] device={dev}")
+        ckpt = ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt"
+        sam = build_sam2("configs/sam2.1/sam2.1_hiera_t.yaml", str(ckpt), device=dev, apply_postprocessing=False)
+        _state["sam"] = SAM2AutomaticMaskGenerator(
+            model=sam, points_per_side=12, points_per_batch=64,
+            pred_iou_thresh=0.7, stability_score_thresh=0.85,
+            crop_n_layers=0, min_mask_region_area=300,
+        )
+    except (ImportError, FileNotFoundError) as e:
+        print(f"[init] SAM2 not available ({e}), segmentation disabled")
+        _state["sam"] = None
 
-    dev = _device()
-    print(f"[init] device={dev}")
-    ckpt = ROOT / "checkpoints" / "sam2.1_hiera_tiny.pt"
-    sam = build_sam2("configs/sam2.1/sam2.1_hiera_t.yaml", str(ckpt), device=dev, apply_postprocessing=False)
-    _state["sam"] = SAM2AutomaticMaskGenerator(
-        model=sam, points_per_side=12, points_per_batch=64,
-        pred_iou_thresh=0.7, stability_score_thresh=0.85,
-        crop_n_layers=0, min_mask_region_area=300,
-    )
+    from ultralytics import YOLO
+    dev = _state.get("device") or _device()
+    _state["device"] = dev
     yolo = YOLO(str(ROOT / "checkpoints" / "yolov8n.pt"))
     _ = yolo.predict(np.zeros((320, 320, 3), dtype=np.uint8), device=dev, verbose=False)
     _state["yolo"] = yolo
-    _state["device"] = dev
     print("[init] models loaded")
 
 

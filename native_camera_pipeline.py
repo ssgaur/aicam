@@ -784,6 +784,13 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
             con.commit()
         cap.release()
         _plog(f"━━━ clip #{job.clip_id} DONE ━━━ frames={sampled_count} stored={job.frames_dir}")
+        counts = clip_counts(job.clip_id)
+        uniq = counts.get("unique_by_class", {})
+        moving = counts.get("moving_unique_by_class", {})
+        if uniq:
+            _plog(f"    🎯 unique objects: {', '.join(f'{k}:{v}' for k,v in uniq.items())}")
+        if moving:
+            _plog(f"    🚶 moving: {', '.join(f'{k}:{v}' for k,v in moving.items())}")
 
         con.execute(
             """
