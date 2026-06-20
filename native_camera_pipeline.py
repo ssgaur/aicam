@@ -66,6 +66,55 @@ TRACK_IOU_MIN = 0.12
 TRACK_CENTER_MAX_PX = 160.0
 TRACK_MOVE_PX = 50.0
 
+# ─── Azure Blob Storage helper ───
+_blob_service = None
+
+def _get_blob_service():
+    """Lazy-init Azure BlobServiceClient from env vars."""
+    global _blob_service
+    if _blob_service is None:
+        account = os.environ.get("AZURE_STORAGE_ACCOUNT")
+        key = os.environ.get("AZURE_STORAGE_KEY")
+        if not account or not key:
+            raise RuntimeError("AZURE_STORAGE_ACCOUNT/KEY not set")
+        from azure.storage.blob import BlobServiceClient
+        _blob_service = BlobServiceClient(
+            account_url=f"https://{account}.blob.core.windows.net",
+            credential=key,
+        )
+    return _blob_service
+
+
+def _upload_to_blob(local_path: Path, frames_dir: Path) -> tuple[str, list[str]]:
+    """Upload clip MP4 + frame JPEGs to Azure Blob Storage. Returns (clip_blob_url, [frame_blob_urls])."""
+    svc = _get_blob_service()
+    clips_container = os.environ.get("AZURE_STORAGE_CLIPS_CONTAINER", "clips")
+    frames_container = os.environ.get("AZURE_STORAGE_FRAMES_CONTAINER", "frames")
+
+    # Upload MP4 — use relative path from DATA as blob name
+    clip_blob_name = str(local_path.relative_to(DATA)) if local_path.is_relative_to(DATA) else local_path.name
+    clip_client = svc.get_blob_client(clips_container, clip_blob_name)
+    with open(local_path, "rb") as f:
+        clip_client.upload_blob(f, overwrite=True, content_settings=_content_settings("video/mp4"))
+    clip_url = clip_client.url
+
+    # Upload frames
+    frame_urls = []
+    if frames_dir.exists():
+        for jpg in sorted(frames_dir.glob("*.jpg")):
+            frame_blob_name = str(jpg.relative_to(DATA)) if jpg.is_relative_to(DATA) else f"{frames_dir.name}/{jpg.name}"
+            frame_client = svc.get_blob_client(frames_container, frame_blob_name)
+            with open(jpg, "rb") as f:
+                frame_client.upload_blob(f, overwrite=True, content_settings=_content_settings("image/jpeg"))
+            frame_urls.append(frame_client.url)
+
+    return clip_url, frame_urls
+
+
+def _content_settings(content_type: str):
+    from azure.storage.blob import ContentSettings
+    return ContentSettings(content_type=content_type)
+
 
 @dataclass
 class ClipJob:
@@ -395,6 +444,13 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_native_tracks_category_last ON object_tracks(category, last_ts);
         """
     )
+    # Migrations: add blob_url columns if missing
+    cols_clips = {r[1] for r in con.execute("PRAGMA table_info(clips)").fetchall()}
+    if "blob_url" not in cols_clips:
+        con.execute("ALTER TABLE clips ADD COLUMN blob_url TEXT")
+    cols_frames = {r[1] for r in con.execute("PRAGMA table_info(sampled_frames)").fetchall()}
+    if "blob_url" not in cols_frames:
+        con.execute("ALTER TABLE sampled_frames ADD COLUMN blob_url TEXT")
     seed_sqlite_sequences_from_postgres(con)
     con.commit()
     con.close()
@@ -810,17 +866,42 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
         except Exception as pg_exc:
             print(f"[postgres-sync] clip_id={job.clip_id} error={pg_exc}")
 
-        # Cloud mode: auto-delete files after processing to save disk
+        # Cloud mode: upload to Azure Blob, then delete locally
         if os.environ.get("AICAM_CLOUD") == "1":
-            try:
-                if job.local_path.exists():
-                    job.local_path.unlink()
-                if job.frames_dir.exists():
-                    import shutil
-                    shutil.rmtree(job.frames_dir)
-                _plog(f"    🗑️  cloud cleanup: deleted clip+frames from disk")
-            except Exception as cleanup_exc:
-                _plog(f"    ⚠️  cleanup error: {cleanup_exc}")
+            has_detections = con.execute(
+                "SELECT COUNT(*) FROM detections WHERE clip_id=?", (job.clip_id,)
+            ).fetchone()[0] > 0
+            if not has_detections:
+                # Empty clip — just delete, no blob upload needed
+                try:
+                    if job.local_path.exists():
+                        job.local_path.unlink()
+                    if job.frames_dir.exists():
+                        shutil.rmtree(job.frames_dir)
+                    _plog(f"    🗑️  empty clip deleted (no detections)")
+                except Exception as cleanup_exc:
+                    _plog(f"    ⚠️  cleanup error: {cleanup_exc}")
+            else:
+                # Has detections — upload to blob, then delete local
+                try:
+                    clip_url, frame_urls = _upload_to_blob(job.local_path, job.frames_dir)
+                    # Store blob URLs in DB
+                    con.execute("UPDATE clips SET blob_url=? WHERE id=?", (clip_url, job.clip_id))
+                    for furl in frame_urls:
+                        fname = furl.rsplit("/", 1)[-1]
+                        con.execute(
+                            "UPDATE sampled_frames SET blob_url=? WHERE clip_id=? AND path LIKE ?",
+                            (furl, job.clip_id, f"%{fname}%"),
+                        )
+                    con.commit()
+                    # Delete local files
+                    if job.local_path.exists():
+                        job.local_path.unlink()
+                    if job.frames_dir.exists():
+                        shutil.rmtree(job.frames_dir)
+                    _plog(f"    ☁️  uploaded to blob + deleted local ({len(frame_urls)} frames)")
+                except Exception as blob_exc:
+                    _plog(f"    ⚠️  blob upload failed, keeping local: {blob_exc}")
     except Exception as exc:
         con.execute("UPDATE clips SET status='error', error=? WHERE id=?", (str(exc), job.clip_id))
         con.commit()

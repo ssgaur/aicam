@@ -233,7 +233,44 @@ async def lifespan(_app: FastAPI):
     native_cam.init_db()
     # Re-queue clips interrupted by a previous shutdown (status='pulled' = uploaded but not processed)
     _requeue_unprocessed_clips()
+    # Start blob cleaner (deletes blobs older than 24h)
+    if os.environ.get("AICAM_CLOUD") == "1":
+        _start_blob_cleaner()
     yield
+
+
+def _start_blob_cleaner():
+    """Background thread: every hour, delete blobs older than 24h from Azure Storage."""
+    def _cleaner_loop():
+        import datetime as _dt
+        while True:
+            time.sleep(3600)  # Run every hour
+            try:
+                account = os.environ.get("AZURE_STORAGE_ACCOUNT")
+                key = os.environ.get("AZURE_STORAGE_KEY")
+                if not account or not key:
+                    continue
+                from azure.storage.blob import BlobServiceClient
+                svc = BlobServiceClient(
+                    account_url=f"https://{account}.blob.core.windows.net",
+                    credential=key,
+                )
+                cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+                deleted = 0
+                for container_name in ["clips", "frames"]:
+                    container = svc.get_container_client(container_name)
+                    for blob in container.list_blobs():
+                        if blob.last_modified and blob.last_modified < cutoff:
+                            container.delete_blob(blob.name)
+                            deleted += 1
+                if deleted:
+                    print(f"[blob-cleaner] Deleted {deleted} blobs older than 24h")
+            except Exception as e:
+                print(f"[blob-cleaner] Error: {e}")
+
+    t = threading.Thread(target=_cleaner_loop, daemon=True, name="blob-cleaner")
+    t.start()
+    print("[startup] Blob cleaner started (deletes >24h old blobs every hour)")
 
 
 def _requeue_unprocessed_clips():
@@ -986,40 +1023,58 @@ from fastapi.responses import FileResponse as _FR  # noqa: E402
 
 @app.get("/media/clip/{clip_id}")
 def serve_clip(clip_id: int):
-    """Serve an mp4 clip by ID."""
+    """Serve an mp4 clip by ID — local file or redirect to blob."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
-    row = con.execute("SELECT local_path FROM clips WHERE id=?", (clip_id,)).fetchone()
+    row = con.execute("SELECT local_path, blob_url FROM clips WHERE id=?", (clip_id,)).fetchone()
     con.close()
-    if not row or not row[0] or not Path(row[0]).exists():
+    if not row:
         return JSONResponse({"error": "clip not found"}, status_code=404)
-    return _FR(row[0], media_type="video/mp4")
+    local_path, blob_url = row[0], row[1] if len(row) > 1 else None
+    if local_path and Path(local_path).exists():
+        return _FR(local_path, media_type="video/mp4")
+    if blob_url:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(blob_url)
+    return JSONResponse({"error": "clip file not available"}, status_code=404)
 
 
 @app.get("/media/frame/{frame_id}")
 def serve_frame(frame_id: int):
-    """Serve a sampled frame JPEG by ID."""
+    """Serve a sampled frame JPEG by ID — local file or redirect to blob."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
-    row = con.execute("SELECT path FROM sampled_frames WHERE id=?", (frame_id,)).fetchone()
+    row = con.execute("SELECT path, blob_url FROM sampled_frames WHERE id=?", (frame_id,)).fetchone()
     con.close()
-    if not row or not row[0] or not Path(row[0]).exists():
+    if not row:
         return JSONResponse({"error": "frame not found"}, status_code=404)
-    return _FR(row[0], media_type="image/jpeg")
+    local_path, blob_url = row[0], row[1] if len(row) > 1 else None
+    if local_path and Path(local_path).exists():
+        return _FR(local_path, media_type="image/jpeg")
+    if blob_url:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(blob_url)
+    return JSONResponse({"error": "frame not available"}, status_code=404)
 
 
 @app.get("/media/clip/{clip_id}/thumb")
 def serve_clip_thumb(clip_id: int):
-    """Serve first frame of a clip as thumbnail."""
+    """Serve first frame of a clip as thumbnail — local or blob redirect."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
     row = con.execute(
-        "SELECT path FROM sampled_frames WHERE clip_id=? ORDER BY id LIMIT 1", (clip_id,)
+        "SELECT path, blob_url FROM sampled_frames WHERE clip_id=? ORDER BY id LIMIT 1", (clip_id,)
     ).fetchone()
     con.close()
-    if not row or not row[0] or not Path(row[0]).exists():
+    if not row:
         return JSONResponse({"error": "no thumb"}, status_code=404)
-    return _FR(row[0], media_type="image/jpeg")
+    local_path, blob_url = row[0], row[1] if len(row) > 1 else None
+    if local_path and Path(local_path).exists():
+        return _FR(local_path, media_type="image/jpeg")
+    if blob_url:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(blob_url)
+    return JSONResponse({"error": "no thumb available"}, status_code=404)
 
 
 @app.get("/snap/latest.jpg")

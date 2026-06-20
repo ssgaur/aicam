@@ -52,6 +52,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .clip-card.active{outline:2px solid var(--accent)}
 .clip-thumb{width:100%;aspect-ratio:16/9;object-fit:cover;background:var(--card2);display:block}
 .clip-thumb-placeholder{width:100%;aspect-ratio:16/9;background:var(--card2);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:24px}
+.clip-thumb-placeholder.cloud{background:linear-gradient(135deg,#1a1f2a 0%,#252a38 100%);flex-direction:column;gap:4px}
+.clip-thumb-placeholder.cloud::after{content:'☁️ Cloud only';font-size:9px;color:var(--muted);opacity:.7}
 .clip-card-info{padding:8px 10px}
 .clip-card-id{font-size:11px;font-weight:700;background:var(--accent2);color:#fff;padding:2px 6px;border-radius:4px;display:inline-block;margin-bottom:4px}
 .clip-card.active .clip-card-id{background:var(--accent)}
@@ -205,6 +207,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   </div>
   <div class="player-video">
     <video id="videoEl" controls autoplay></video>
+    <div id="noVideoMsg" style="display:none;flex-direction:column;align-items:center;gap:12px;color:var(--muted);font-size:14px">
+      <span style="font-size:48px">☁️</span>
+      <span>Video file auto-deleted (cloud mode)</span>
+      <span style="font-size:11px">Detection data & metadata preserved in database</span>
+    </div>
   </div>
   <div class="frame-carousel">
     <div class="frame-carousel-header">
@@ -381,12 +388,13 @@ async function loadClips(){
                   (c.has_activity?'<span class="clip-badge active">Active</span>':'');
       const objs=Object.entries(c.objects||{}).map(([cls,cnt])=>{
         const moving=(c.tracks||[]).some(t=>t.cls===cls&&t.moving);
-        return `<span class="obj-tag${moving?' moving'}">${cls}×${cnt}</span>`;
+        return `<span class="obj-tag${moving?' moving':''}">${cls}×${cnt}</span>`;
       }).join('');
+      const thumb=`<img class="clip-thumb" src="${API}/media/clip/${c.id}/thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="clip-thumb-placeholder cloud" style="display:none">📊</div>`;
       return `
         <div class="${cardCls}" onclick="openClip(${i})" id="crow-${i}">
           ${badge}
-          <img class="clip-thumb" src="${API}/media/clip/${c.id}/thumb" onerror="this.outerHTML='<div class=\\'clip-thumb-placeholder\\'>🎬</div>'">
+          ${thumb}
           <div class="clip-card-info">
             <span class="clip-card-id">#${c.id}</span>
             <div class="clip-card-time">${fmtTime(c.start_ts)}</div>
@@ -411,7 +419,9 @@ function openClip(idx){
   document.getElementById('playerTitle').textContent=`Clip #${c.id} — ${fmtIST(c.start_ts)}`;
   const vid=document.getElementById('videoEl');
   vid.src=`${API}/media/clip/${c.id}`;
-  vid.load();vid.play();
+  vid.onerror=()=>{vid.style.display='none';document.getElementById('noVideoMsg').style.display='flex';};
+  vid.onloadeddata=()=>{vid.style.display='';document.getElementById('noVideoMsg').style.display='none';};
+  vid.load();vid.play().catch(()=>{});
   loadFrames(c.id);
   document.body.style.overflow='hidden';
 }
