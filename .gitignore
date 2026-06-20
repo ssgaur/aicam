@@ -8,4 +8,10 @@ app/.dart_tool/
 app/.idea/
 .DS_Store
 backend/.env
+.env
 data/
+*.session
+AiCameraX/app/build/
+AiCameraX/.gradle/
+AiCameraX/build/
+AiCameraX/local.properties

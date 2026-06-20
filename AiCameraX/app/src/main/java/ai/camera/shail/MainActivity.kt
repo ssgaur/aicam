@@ -65,12 +65,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.asRequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
@@ -89,7 +85,6 @@ class MainActivity : ComponentActivity() {
         .writeTimeout(3, TimeUnit.MINUTES)
         .readTimeout(3, TimeUnit.MINUTES)
         .apply {
-            // Trust self-signed certs (private AiCam server)
             val trustAll = object : javax.net.ssl.X509TrustManager {
                 override fun checkClientTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
                 override fun checkServerTrusted(chain: Array<java.security.cert.X509Certificate>, authType: String) {}
@@ -102,6 +97,8 @@ class MainActivity : ComponentActivity() {
         }
         .build()
 
+    private lateinit var uploadQueue: UploadQueue
+
     private var hasCameraPermission by mutableStateOf(false)
     private var cameraReady by mutableStateOf(false)
     private var backendUrl by mutableStateOf(DEFAULT_BACKEND)
@@ -111,9 +108,10 @@ class MainActivity : ComponentActivity() {
     private var isRunning by mutableStateOf(false)
     private var isRecording by mutableStateOf(false)
     private var chunkIndex by mutableStateOf(0)
-    private var uploadedCount by mutableStateOf(0)
-    private var errorCount by mutableStateOf(0)
+    private var queueStatus by mutableStateOf("↑0")
     private var backendOk by mutableStateOf<Boolean?>(null)
+    private var showRetryPrompt by mutableStateOf(false)
+    private var pendingOnDisk by mutableStateOf(0)
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -129,6 +127,34 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Initialize upload queue
+        uploadQueue = UploadQueue(
+            context = this,
+            http = http,
+            getBackendUrl = { backendUrl },
+            getSampleFps = { sampleFpsText.toDoubleOrNull()?.coerceIn(0.2, 10.0) ?: 2.0 },
+            getChunkSeconds = { chunkSecondsText.toDoubleOrNull()?.coerceIn(3.0, 300.0) ?: 10.0 },
+        )
+        uploadQueue.start()
+
+        // Check if there are unsent chunks from previous session
+        val chunksDir = File(cacheDir, "aicam_chunks")
+        val existingCount = chunksDir.listFiles()?.count { it.extension == "mp4" } ?: 0
+        if (existingCount > 0) {
+            pendingOnDisk = existingCount
+            showRetryPrompt = true
+            statusText = "$existingCount unsent clips found"
+        }
+
+        // Periodic UI refresh for queue stats
+        lifecycleScope.launch {
+            while (true) {
+                queueStatus = uploadQueue.summaryText()
+                delay(1000)
+            }
+        }
+
         hasCameraPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         setContent {
             AICameraXTheme {
@@ -145,6 +171,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         stopLoop()
         recording?.stop()
+        uploadQueue.stop()
         super.onDestroy()
     }
 
@@ -216,21 +243,67 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun TopStatus() {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(8.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Chip("AI CameraX")
-            Chip(
-                if (isRecording) "REC #$chunkIndex" else if (isRunning) "running" else if (cameraReady) "idle" else "camera loading",
-                if (isRecording) Color(0xFFB71C1C) else Color.Black,
-            )
-            Chip(statusText)
-            Spacer(modifier = Modifier.weight(1f))
-            Chip("uploaded:$uploadedCount errors:$errorCount")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Chip("AI CameraX")
+                Chip(
+                    if (isRecording) "REC #$chunkIndex" else if (isRunning) "running" else if (cameraReady) "idle" else "camera loading",
+                    if (isRecording) Color(0xFFB71C1C) else Color.Black,
+                )
+                Chip(statusText)
+                Spacer(modifier = Modifier.weight(1f))
+                Chip(queueStatus, Color(0xFF1B5E20))
+            }
+            // Retry prompt banner
+            if (showRetryPrompt) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFFFFF3E0), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "$pendingOnDisk unsent clips. Send now?",
+                        fontSize = 12.sp,
+                        color = Color(0xFF212121),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(
+                        onClick = {
+                            uploadQueue.retryAll()
+                            showRetryPrompt = false
+                            statusText = "Sending $pendingOnDisk queued clips..."
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                        contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
+                    ) {
+                        Text("Send", fontSize = 11.sp)
+                    }
+                    Button(
+                        onClick = {
+                            uploadQueue.clearAll()
+                            showRetryPrompt = false
+                            pendingOnDisk = 0
+                            statusText = "Queued clips deleted"
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                        contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
+                    ) {
+                        Text("Delete", fontSize = 11.sp)
+                    }
+                }
+            }
         }
     }
 
@@ -344,10 +417,10 @@ class MainActivity : ComponentActivity() {
             return
         }
         isRunning = true
-        uploadedCount = 0
-        errorCount = 0
         chunkIndex = 0
         statusText = "Starting chunks"
+        showRetryPrompt = false
+        uploadQueue.resume()
         chunkJob = lifecycleScope.launch {
             while (isRunning) {
                 val current = chunkIndex + 1
@@ -355,27 +428,14 @@ class MainActivity : ComponentActivity() {
                 try {
                     val seconds = chunkSecondsText.toIntOrNull()?.coerceIn(3, 300) ?: 10
                     val file = recordChunk(current, seconds)
-                    // Upload in background — don't block next recording
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        try {
-                            val ok = uploadClip(file, current)
-                            if (ok) {
-                                uploadedCount += 1
-                                file.delete()
-                            } else {
-                                errorCount += 1
-                            }
-                        } catch (_: Exception) {
-                            errorCount += 1
-                        }
-                    }
-                    statusText = "REC #${current + 1} (uploading #$current)"
+                    // Enqueue for upload (queue handles parallel sending + retries)
+                    uploadQueue.enqueue(file, current)
+                    statusText = "REC #${current + 1} queued #$current"
                 } catch (e: CancellationException) {
                     isRecording = false
                     statusText = "Stopped"
                     break
                 } catch (e: Exception) {
-                    errorCount += 1
                     statusText = "Chunk #$current error: ${e.message}"
                     delay(1500)
                 }
@@ -438,29 +498,5 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun uploadClip(file: File, index: Int): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val now = System.currentTimeMillis() / 1000.0
-            val seconds = chunkSecondsText.toDoubleOrNull()?.coerceIn(3.0, 300.0) ?: 10.0
-            val startTs = now - seconds
-            val sampleFps = sampleFpsText.toDoubleOrNull()?.coerceIn(0.2, 10.0) ?: 2.0
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("start_ts", "%.3f".format(startTs))
-                .addFormDataPart("end_ts", "%.3f".format(now))
-                .addFormDataPart("sample_fps", sampleFps.toString())
-                .addFormDataPart("conf", "0.35")
-                .addFormDataPart("chunk_index", index.toString())
-                .addFormDataPart("device_id", "native-camerax")
-                .addFormDataPart("file", file.name, file.asRequestBody("video/mp4".toMediaType()))
-                .build()
-            val req = Request.Builder()
-                .url("${backendUrl.trimEnd('/')}/api/native/upload")
-                .post(body)
-                .build()
-            http.newCall(req).execute().use { it.isSuccessful }
-        } catch (_: Exception) {
-            false
-        }
-    }
 }
+

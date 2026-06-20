@@ -708,7 +708,7 @@ def sample_times(duration: float, sample_fps: float) -> list[float]:
 
 
 def run_yolo(model: YOLO, device: str, frame: np.ndarray, conf: float) -> list[dict[str, Any]]:
-    result = model.predict(frame, conf=conf, device=device, verbose=False)[0]
+    result = model.predict(frame, conf=conf, device=device, imgsz=640, verbose=False)[0]
     names = result.names
     detections: list[dict[str, Any]] = []
     if result.boxes is None:

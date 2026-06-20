@@ -703,7 +703,7 @@ async def api_native_upload(
     file: UploadFile = File(...),
     start_ts: float = Form(...),
     end_ts: float = Form(...),
-    sample_fps: float = Form(1.0),
+    sample_fps: float = Form(0.3),
     conf: float = Form(0.35),
     chunk_index: int = Form(0),
     device_id: str = Form("android"),
@@ -733,7 +733,7 @@ async def api_native_upload(
     _native_upload_queue.put(
         {
             "job": native_cam.ClipJob(clip_id=clip_id, phone_path=phone_path, local_path=local_path, frames_dir=frames_dir),
-            "sample_fps": sample_fps,
+            "sample_fps": min(sample_fps, 0.5),
             "conf": conf,
         }
     )
@@ -1006,6 +1006,42 @@ def api_native_clip_frames(clip_id: int):
             for r in rows
         ],
     }
+
+
+@app.delete("/api/native/clips/{clip_id}")
+def api_native_delete_clip(clip_id: int):
+    """Delete a clip from DB, blob, and disk."""
+    native_cam.init_db()
+    con = sqlite3.connect(native_cam.DB_PATH)
+    row = con.execute("SELECT local_path, blob_url, frames_dir FROM clips WHERE id=?", (clip_id,)).fetchone()
+    if not row:
+        con.close()
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    local_path, blob_url, frames_dir = row
+    if blob_url:
+        try:
+            from urllib.parse import urlparse
+            parts = urlparse(blob_url)
+            container_name = parts.path.split("/")[1]
+            blob_name = "/".join(parts.path.split("/")[2:])
+            from azure.storage.blob import BlobServiceClient
+            account = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
+            key = os.environ.get("AZURE_STORAGE_KEY", "")
+            svc = BlobServiceClient(account_url=f"https://{account}.blob.core.windows.net", credential=key)
+            svc.get_blob_client(container_name, blob_name).delete_blob()
+        except Exception as e:
+            print(f"[delete] blob cleanup error: {e}")
+    if local_path and Path(local_path).exists():
+        Path(local_path).unlink(missing_ok=True)
+    if frames_dir and Path(frames_dir).exists():
+        shutil.rmtree(frames_dir, ignore_errors=True)
+    con.execute("DELETE FROM detections WHERE clip_id=?", (clip_id,))
+    con.execute("DELETE FROM sampled_frames WHERE clip_id=?", (clip_id,))
+    con.execute("DELETE FROM object_tracks WHERE clip_id=?", (clip_id,))
+    con.execute("DELETE FROM clips WHERE id=?", (clip_id,))
+    con.commit()
+    con.close()
+    return {"ok": True, "deleted": clip_id}
 
 
 @app.get("/api/native/clips/range")

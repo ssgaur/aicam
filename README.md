@@ -1,102 +1,155 @@
-# AiCam — Local AI camera
+# AiCam — 24/7 AI Surveillance Camera
 
-AiCam turns an Android phone into a local AI camera. The recommended path is the
-native **AI CameraX** Android app plus the local FastAPI backend.
+Turn any Android phone into a 24/7 AI-powered surveillance camera with cloud-based
+object detection, rolling 24h video archival, and a web viewer with AI insights.
 
-```text
-Android CameraX app
-→ records MP4 chunks
-→ uploads to laptop backend over local LAN
-→ deletes temp phone clip after upload
-→ laptop samples frames
-→ local YOLO counts people/cars/bikes/dogs
-→ SQLite/Postgres store results
+```
+Phone (CameraX)          Azure VM (D4s_v5)              Azure Blob
+┌──────────┐   HTTPS    ┌──────────────────┐  upload   ┌───────────┐
+│ 10s MP4  │ ────────→  │ FastAPI + YOLOv8 │ ───────→  │ clips/    │
+│ chunks   │  parallel  │ detect objects   │           │ frames/   │
+│ retry Q  │  3 workers │ track + store    │           │ 24h keep  │
+└──────────┘            └──────────────────┘           └───────────┘
+                               │                            │
+                         SQLite + Postgres            SAS URL serve
+                               │                            │
+                        ┌──────┴──────┐              ┌──────┴──────┐
+                        │ /viewer     │  ←───────→   │ video/thumb │
+                        │ AI insights │              │ playback    │
+                        └─────────────┘              └─────────────┘
 ```
 
-**Copilot is not needed to run this. Internet is not needed after setup.**
+## Quick Start
 
-Start here:
+### Local (laptop + phone over USB/WiFi)
 
-```text
-docs/AI_CAM_BEGINNER_GUIDE.md
+```bash
+git clone https://github.com/ssgaur/aicam.git && cd aicam
+./start.sh
+# Open http://localhost:8100/viewer
+# On phone: set backend URL to http://<LAN_IP>:8100, tap Start
 ```
 
-Phone (Flutter) streams JPEG frames over WebSocket → Mac backend runs **SAM 2 Hiera-Tiny** (auto mask generator) on MPS → returns colored mask overlay → phone composites on live preview.
+### Cloud (Azure VM)
+
+```bash
+# Deploy to Azure VM (already provisioned: 20.197.31.88)
+scp native_camera_pipeline.py backend/main.py viewer.html azureuser@20.197.31.88:~/aicam/
+ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
+# On phone: set backend URL to https://20.197.31.88:8100, tap Start
+# Viewer: https://20.197.31.88:8100/viewer
+```
 
 ## Architecture
-- **AiCameraX/** — native Android CameraX app, recommended product path.
-- **app/** — older Flutter prototype. Camera preview + WebSocket client.
-- **backend/** — FastAPI + sam2 + PyTorch (MPS on Mac, CUDA in cloud).
-- **native_camera_pipeline.py** — local YOLO sampling/tracking/SQLite logic.
-- **postgres_store.py** — Postgres durable metadata sync and summary queries.
-- **checkpoints/** — `sam2.1_hiera_tiny.pt` (~149 MB, gitignored). Download:
-  ```
-  curl -L -o checkpoints/sam2.1_hiera_tiny.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt
-  ```
 
-## Run backend (Mac)
-```
-cd backend && source ../venv/bin/activate
-uvicorn main:app --host 0.0.0.0 --port 8100
-```
+| Component | Description |
+|-----------|-------------|
+| **AiCameraX/** | Android app — CameraX 10s MP4 recording, enterprise retry queue (3 parallel, exponential backoff, self-healing health checks) |
+| **backend/main.py** | FastAPI server — upload endpoint, YOLO worker, media serving via SAS URLs, blob cleaner, insights API |
+| **native_camera_pipeline.py** | YOLO processing pipeline — frame sampling, object detection (imgsz=640), tracking, blob upload |
+| **viewer.html** | Single-page timeline viewer — coverage banner, detection badges, object tags, delete clips, AI insights panel |
+| **postgres_store.py** | Postgres sync for durable analytics |
+| **start.sh** | One-command local setup: venv, deps, DB, network detect, launch |
 
-## Performance
-- Mac M1 Pro MPS @ 320px, 12×12 points: ~1 FPS, ~150 KB PNG/frame.
-- Cloud GPU (T4 / A10): 5–10 FPS at 512px.
+## Key Features
 
-## Endpoints
-- `GET /healthz` → `{ok, device, loaded}`
-- `WS /ws/segment` → recv JPEG bytes, send PNG RGBA overlay bytes.
+- **24/7 recording** — 10s MP4 chunks, no gaps (parallel upload doesn't block recording)
+- **Enterprise retry queue** — phone stores failed uploads locally, auto-retries with exponential backoff, manual retry/delete from UI
+- **Self-healing** — health check every 15s, auto-resumes on server recovery, requeues on app restart
+- **YOLOv8n detection** — person, car, truck, motorcycle, etc. at 640px (~0.08s/frame on D4s_v5)
+- **Object tracking** — cross-frame unique object counting via IoU tracker
+- **24h rolling archival** — all clips + frames uploaded to Azure Blob, auto-cleaned after 24h
+- **Private blob access** — SAS token URLs for secure browser playback
+- **Web viewer** — timeline slider, 5m–24h windows, active/empty badges, delete button, AI insights
+- **Analytics preserved** — DB records (detections, tracks, counts) kept permanently even after video expires
 
-## Native OnePlus Camera chunk pipeline
+## Azure Infrastructure
 
-For higher-quality street/object counting, use the phone's native OnePlus
-Camera app instead of the Flutter preview stream:
+| Resource | Spec | Cost/month |
+|----------|------|------------|
+| VM | D4s_v5 (4 dedicated CPU, 16GB RAM) | ~₹4,000 |
+| OS Disk | 64GB Premium SSD | ~₹400 |
+| Blob Storage | ~432GB hot tier (24h rolling) | ~₹648 |
+| Blob Ops | ~8,640 writes/day × 11 blobs | ~₹100 |
+| Postgres | Shared (assamese-learn-db) | ₹0 |
+| Network | Ingress free, minimal egress | ~₹100 |
+| **Total** | | **~₹5,248/month (~$62)** |
 
-```bash
-cd /Users/shailendrasingh/PersonalDev/aicam
-source venv/bin/activate
+## Phone App (AiCameraX)
 
-# Record 10-second MP4 chunks, pull them from the phone, sample frames at 3 FPS,
-# run local YOLO tracking, and store clips/frames/counts in SQLite.
-./run_native_camera.sh
+The Android app lives in `AiCameraX/`. Key files:
 
-# Or run directly:
-python native_camera_pipeline.py run --chunks 30 --duration 10 --sample-fps 3
+- `MainActivity.kt` — camera preview, recording loop, UI controls
+- `UploadQueue.kt` — enterprise retry queue (parallel uploads, backoff, health check, disk-based persistence)
 
-# Ask what happened most recently.
-python native_camera_pipeline.py status
-```
-
-Data is written under `data/native_camera/`:
-
-- `clips/` — original high-quality MP4 chunks from the OnePlus Camera app
-- `frames/` — sampled JPG frames used for YOLO processing
-- `native_camera.db` — SQLite tables for clips, sampled frames, detections, and unique object tracks
-
-This native pipeline is local-only after setup: ADB controls the phone over USB,
-the OnePlus Camera records video, `adb pull` copies MP4s to the Mac, and YOLO
-runs locally. It does not call Azure/OpenAI/Copilot.
-
-See [`docs/NATIVE_CAMERA_PIPELINE.md`](docs/NATIVE_CAMERA_PIPELINE.md) for the
-full tomorrow runbook, storage estimates, and troubleshooting notes.
-
-## CameraX real AI cam branch
-
-The app also has a **Start Real AI Cam** mode that records MP4 chunks directly
-inside the Android app and uploads them to the Mac backend. This avoids ADB
-record/stop tapping.
-
-See [`docs/CAMERAX_AI_CAM.md`](docs/CAMERAX_AI_CAM.md).
-
-Durable object metadata can be stored in local Postgres:
+### Build & Install
 
 ```bash
-python postgres_store.py sync
-python postgres_store.py summary --since 10m
+cd AiCameraX
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## TODO
-- Tap-to-track mode (SAM 2 video predictor with memory bank).
-- Send RLE masks instead of PNG (smaller, faster).
-- Auto-shutdown cloud GPU when phone disconnects.
+### UI Status Chip
+
+The green chip on the top-right shows: `↑uploaded ⟳in-flight ⏳pending`
+
+On app restart, if unsent clips exist, a banner appears: **"N unsent clips — Send / Delete?"**
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/healthz` | Health check |
+| POST | `/api/native/upload` | Upload MP4 chunk (multipart) |
+| GET | `/api/native/clips?minutes=N` | List clips in time window |
+| GET | `/api/native/clips/range` | Min/max timestamps |
+| GET | `/api/native/status` | Worker status, queue depth |
+| GET | `/api/native/insights` | AI narrative + stats |
+| GET | `/api/native/clips/{id}/frames` | Frame list for a clip |
+| DELETE | `/api/native/clips/{id}` | Delete clip (DB + blob + disk) |
+| GET | `/media/clip/{id}` | Serve video (SAS redirect) |
+| GET | `/media/clip/{id}/thumb` | Serve thumbnail |
+| GET | `/media/frame/{id}` | Serve frame image |
+| GET | `/viewer` | Web viewer UI |
+
+## Data Storage
+
+```
+data/native_camera/
+├── native_camera.db     # SQLite: clips, frames, detections, tracks
+├── clips/               # Temporary MP4 storage (deleted after blob upload)
+└── frames/              # Temporary JPEG frames (deleted after blob upload)
+```
+
+**Blob containers** (`aicamstorage2026`):
+- `clips/` — MP4 video files
+- `frames/` — JPEG sampled frames
+
+## Configuration
+
+Environment variables (`.env` on VM):
+
+```
+AICAM_CLOUD=1                    # Enable blob upload + local cleanup
+AZURE_STORAGE_ACCOUNT=aicamstorage2026
+AZURE_STORAGE_KEY=<key>
+AICAM_PG_DSN=postgresql://...    # Postgres connection string
+```
+
+## Development
+
+All changes should be made in this repo and deployed via `scp`:
+
+```bash
+# Edit locally → deploy → restart
+scp native_camera_pipeline.py backend/main.py viewer.html azureuser@20.197.31.88:~/aicam/
+ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
+```
+
+Validate before deploying:
+
+```bash
+python3 -c "import ast; ast.parse(open('backend/main.py').read()); print('OK')"
+node -e "const fs=require('fs');const h=fs.readFileSync('viewer.html','utf8');const m=h.match(/<script>([\s\S]*?)<\/script>/);new Function(m[1]);console.log('OK')"
+```
