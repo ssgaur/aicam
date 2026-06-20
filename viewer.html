@@ -148,14 +148,36 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <span class="header-info" id="headerInfo">connecting…</span>
 </div>
 
+<!-- Data Coverage Banner -->
+<div class="coverage-banner" id="coverageBanner" style="margin:12px 20px;background:var(--card);border-radius:10px;padding:14px 18px;display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="font-size:20px" id="coverageIcon">📡</span>
+      <div>
+        <div style="font-size:13px;font-weight:600" id="coverageTitle">—</div>
+        <div style="font-size:11px;color:var(--muted)" id="coverageSubtitle">—</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:16px;font-size:11px">
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--accent)" id="covTotal">0</div><div style="color:var(--muted)">Total</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--green)" id="covActive">0</div><div style="color:var(--muted)">Active</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--red)" id="covEmpty">0</div><div style="color:var(--muted)">Empty</div></div>
+      <div style="text-align:center"><div style="font-size:18px;font-weight:700;color:var(--muted)" id="covHours">0</div><div style="color:var(--muted)">Hours</div></div>
+    </div>
+  </div>
+</div>
+
 <div class="timeline-box">
   <div class="timeline-top">
     <h2>Timeline</h2>
     <div class="window-btns">
       <button data-win="5" onclick="setWindow(5)">5m</button>
-      <button data-win="10" class="active" onclick="setWindow(10)">10m</button>
+      <button data-win="10" onclick="setWindow(10)">10m</button>
       <button data-win="30" onclick="setWindow(30)">30m</button>
-      <button data-win="60" onclick="setWindow(60)">1h</button>
+      <button data-win="60" class="active" onclick="setWindow(60)">1h</button>
+      <button data-win="240" onclick="setWindow(240)">4h</button>
+      <button data-win="720" onclick="setWindow(720)">12h</button>
+      <button data-win="1440" onclick="setWindow(1440)">24h</button>
     </div>
   </div>
   <div class="slider-area" id="sliderArea">
@@ -237,7 +259,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <script>
 const API = window.location.origin;
 let gMin=0, gMax=0, totalClips=0;
-let windowMin=10; // minutes
+let windowMin=60; // default 1 hour
 let sliderPct=1; // 0..1 position of window center on timeline (1 = rightmost = latest)
 let currentClips=[];
 let currentClipIdx=-1;
@@ -251,11 +273,43 @@ async function init(){
     const r=await fetch(`${API}/api/native/clips/range`);
     const d=await r.json();
     gMin=d.min_ts||0;
-    gMax=Math.max(d.max_ts||0, Date.now()/1000); // always extend to current time
+    gMax=Math.max(d.max_ts||0, Date.now()/1000);
     totalClips=d.total_clips||0;
     document.getElementById('liveDot').className='dot on';
     document.getElementById('headerInfo').textContent=`${totalClips} clips total`;
-    positionSliderAtEnd();
+
+    // Coverage banner
+    const hours = ((d.max_ts||0) - (d.min_ts||0)) / 3600;
+    const lastAgo = (Date.now()/1000 - (d.max_ts||0));
+    const isLive = lastAgo < 30;
+    const banner = document.getElementById('coverageBanner');
+    banner.style.display='block';
+    document.getElementById('covTotal').textContent = totalClips;
+    document.getElementById('covHours').textContent = hours.toFixed(1);
+    if(isLive){
+      document.getElementById('coverageIcon').textContent = '🟢';
+      document.getElementById('coverageTitle').textContent = 'LIVE — Recording now';
+      document.getElementById('coverageSubtitle').textContent = `${fmtTime(d.min_ts)} → now · Last clip ${Math.round(lastAgo)}s ago`;
+    } else {
+      document.getElementById('coverageIcon').textContent = '⏸️';
+      document.getElementById('coverageTitle').textContent = 'Camera stopped';
+      document.getElementById('coverageSubtitle').textContent = `Data: ${fmtIST(d.min_ts)} → ${fmtIST(d.max_ts)} (${Math.round(lastAgo/60)} min ago)`;
+    }
+
+    // Fetch active/empty counts
+    fetch(`${API}/api/native/insights?start=${d.min_ts}&end=${d.max_ts}`).then(r=>r.json()).then(ins=>{
+      document.getElementById('covActive').textContent = ins.active_clips||0;
+      document.getElementById('covEmpty').textContent = ins.empty_clips||0;
+    }).catch(()=>{});
+
+    // If last clip is old, snap to last clip
+    if(lastAgo > windowMin*60 && d.max_ts){
+      const range = gMax - gMin;
+      sliderPct = range>0 ? (d.max_ts - gMin) / range : 1;
+    } else {
+      sliderPct = 1;
+    }
+    updateSliderUI();
     loadClips();
   }catch(e){
     document.getElementById('liveDot').className='dot off';

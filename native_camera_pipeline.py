@@ -866,42 +866,29 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
         except Exception as pg_exc:
             print(f"[postgres-sync] clip_id={job.clip_id} error={pg_exc}")
 
-        # Cloud mode: upload to Azure Blob, then delete locally
+        # Cloud mode: upload ALL clips to Azure Blob, then delete locally
         if os.environ.get("AICAM_CLOUD") == "1":
-            has_detections = con.execute(
-                "SELECT COUNT(*) FROM detections WHERE clip_id=?", (job.clip_id,)
-            ).fetchone()[0] > 0
-            if not has_detections:
-                # Empty clip — just delete, no blob upload needed
-                try:
-                    if job.local_path.exists():
-                        job.local_path.unlink()
-                    if job.frames_dir.exists():
-                        shutil.rmtree(job.frames_dir)
-                    _plog(f"    🗑️  empty clip deleted (no detections)")
-                except Exception as cleanup_exc:
-                    _plog(f"    ⚠️  cleanup error: {cleanup_exc}")
-            else:
-                # Has detections — upload to blob, then delete local
-                try:
-                    clip_url, frame_urls = _upload_to_blob(job.local_path, job.frames_dir)
-                    # Store blob URLs in DB
-                    con.execute("UPDATE clips SET blob_url=? WHERE id=?", (clip_url, job.clip_id))
-                    for furl in frame_urls:
-                        fname = furl.rsplit("/", 1)[-1]
-                        con.execute(
-                            "UPDATE sampled_frames SET blob_url=? WHERE clip_id=? AND path LIKE ?",
-                            (furl, job.clip_id, f"%{fname}%"),
-                        )
-                    con.commit()
-                    # Delete local files
-                    if job.local_path.exists():
-                        job.local_path.unlink()
-                    if job.frames_dir.exists():
-                        shutil.rmtree(job.frames_dir)
-                    _plog(f"    ☁️  uploaded to blob + deleted local ({len(frame_urls)} frames)")
-                except Exception as blob_exc:
-                    _plog(f"    ⚠️  blob upload failed, keeping local: {blob_exc}")
+            try:
+                clip_url, frame_urls = _upload_to_blob(job.local_path, job.frames_dir)
+                con.execute("UPDATE clips SET blob_url=? WHERE id=?", (clip_url, job.clip_id))
+                for furl in frame_urls:
+                    fname = furl.rsplit("/", 1)[-1]
+                    con.execute(
+                        "UPDATE sampled_frames SET blob_url=? WHERE clip_id=? AND path LIKE ?",
+                        (furl, job.clip_id, f"%{fname}%"),
+                    )
+                con.commit()
+                if job.local_path.exists():
+                    job.local_path.unlink()
+                if job.frames_dir.exists():
+                    shutil.rmtree(job.frames_dir)
+                has_det = con.execute(
+                    "SELECT COUNT(*) FROM detections WHERE clip_id=?", (job.clip_id,)
+                ).fetchone()[0] > 0
+                tag = "🎯" if has_det else "📦"
+                _plog(f"    {tag} blob uploaded + local deleted ({len(frame_urls)} frames)")
+            except Exception as blob_exc:
+                _plog(f"    ⚠️  blob upload failed, keeping local: {blob_exc}")
     except Exception as exc:
         con.execute("UPDATE clips SET status='error', error=? WHERE id=?", (str(exc), job.clip_id))
         con.commit()

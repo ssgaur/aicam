@@ -1021,9 +1021,38 @@ def api_native_clips_range():
 from fastapi.responses import FileResponse as _FR  # noqa: E402
 
 
+def _blob_sas_url(blob_url: str) -> str:
+    """Generate a short-lived SAS URL (1h) from a stored blob URL."""
+    from urllib.parse import urlparse
+    from datetime import datetime, timedelta, timezone as _tz
+    from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+
+    account = os.environ.get("AZURE_STORAGE_ACCOUNT", "")
+    key = os.environ.get("AZURE_STORAGE_KEY", "")
+    if not account or not key:
+        return blob_url  # fallback
+
+    parsed = urlparse(blob_url)
+    # path = /container/blob_name
+    parts = parsed.path.lstrip("/").split("/", 1)
+    if len(parts) < 2:
+        return blob_url
+    container, blob_name = parts[0], parts[1]
+
+    sas = generate_blob_sas(
+        account_name=account,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(_tz.utc) + timedelta(hours=1),
+    )
+    return f"https://{account}.blob.core.windows.net/{container}/{blob_name}?{sas}"
+
+
 @app.get("/media/clip/{clip_id}")
 def serve_clip(clip_id: int):
-    """Serve an mp4 clip by ID — local file or redirect to blob."""
+    """Serve an mp4 clip by ID — local file or redirect to blob with SAS."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
     row = con.execute("SELECT local_path, blob_url FROM clips WHERE id=?", (clip_id,)).fetchone()
@@ -1035,13 +1064,13 @@ def serve_clip(clip_id: int):
         return _FR(local_path, media_type="video/mp4")
     if blob_url:
         from fastapi.responses import RedirectResponse
-        return RedirectResponse(blob_url)
+        return RedirectResponse(_blob_sas_url(blob_url))
     return JSONResponse({"error": "clip file not available"}, status_code=404)
 
 
 @app.get("/media/frame/{frame_id}")
 def serve_frame(frame_id: int):
-    """Serve a sampled frame JPEG by ID — local file or redirect to blob."""
+    """Serve a sampled frame JPEG by ID — local file or redirect to blob with SAS."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
     row = con.execute("SELECT path, blob_url FROM sampled_frames WHERE id=?", (frame_id,)).fetchone()
@@ -1053,13 +1082,13 @@ def serve_frame(frame_id: int):
         return _FR(local_path, media_type="image/jpeg")
     if blob_url:
         from fastapi.responses import RedirectResponse
-        return RedirectResponse(blob_url)
+        return RedirectResponse(_blob_sas_url(blob_url))
     return JSONResponse({"error": "frame not available"}, status_code=404)
 
 
 @app.get("/media/clip/{clip_id}/thumb")
 def serve_clip_thumb(clip_id: int):
-    """Serve first frame of a clip as thumbnail — local or blob redirect."""
+    """Serve first frame of a clip as thumbnail — local or blob SAS redirect."""
     native_cam.init_db()
     con = sqlite3.connect(native_cam.DB_PATH)
     row = con.execute(
@@ -1073,7 +1102,7 @@ def serve_clip_thumb(clip_id: int):
         return _FR(local_path, media_type="image/jpeg")
     if blob_url:
         from fastapi.responses import RedirectResponse
-        return RedirectResponse(blob_url)
+        return RedirectResponse(_blob_sas_url(blob_url))
     return JSONResponse({"error": "no thumb available"}, status_code=404)
 
 
