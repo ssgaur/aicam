@@ -189,8 +189,8 @@ class MainActivity : ComponentActivity() {
                         it.setSurfaceProvider(view.surfaceProvider)
                     }
                     val qualitySelector = QualitySelector.fromOrderedList(
-                        listOf(Quality.UHD, Quality.FHD, Quality.HD),
-                        androidx.camera.video.FallbackStrategy.lowerQualityOrHigherThan(Quality.HD),
+                        listOf(Quality.HD, Quality.FHD),
+                        androidx.camera.video.FallbackStrategy.higherQualityOrLowerThan(Quality.HD),
                     )
                     val recorder = Recorder.Builder()
                         .setQualitySelector(qualitySelector)

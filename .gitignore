@@ -15,3 +15,14 @@ AiCameraX/app/build/
 AiCameraX/.gradle/
 AiCameraX/build/
 AiCameraX/local.properties
+
+# Flutter viewer app build artifacts
+AiCamViewer/.dart_tool/
+AiCamViewer/build/
+AiCamViewer/.flutter-plugins
+AiCamViewer/.flutter-plugins-dependencies
+AiCamViewer/ios/Pods/
+AiCamViewer/ios/.symlinks/
+AiCamViewer/android/.gradle/
+AiCamViewer/android/app/build/
+AiCamViewer/.idea/

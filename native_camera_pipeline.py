@@ -1455,9 +1455,9 @@ def doctor() -> None:
         print("adb_device=ok")
     except Exception as exc:
         print(f"adb_device=error: {exc}")
-    print(f"mp4_count={len(list(CLIPS.glob('*.mp4'))) if CLIPS.exists() else 0}")
+    print(f"mp4_count={len(list(CLIPS.rglob('*.mp4'))) if CLIPS.exists() else 0}")
     print(f"jpg_count={len(list(FRAMES.rglob('*.jpg'))) if FRAMES.exists() else 0}")
-    print(f"to_be_deleted_mp4_count={len(list(TO_BE_DELETED_CLIPS.glob('*.mp4'))) if TO_BE_DELETED_CLIPS.exists() else 0}")
+    print(f"to_be_deleted_mp4_count={len(list(TO_BE_DELETED_CLIPS.rglob('*.mp4'))) if TO_BE_DELETED_CLIPS.exists() else 0}")
 
 
 def main() -> int:
