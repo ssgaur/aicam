@@ -17,8 +17,10 @@ class AicamApi {
     return _IOClient(httpClient);
   }
 
-  Future<List<Clip>> getClips({int minutes = 60}) async {
-    final url = '$baseUrl/api/native/clips?minutes=$minutes';
+  Future<List<Clip>> getClips({int minutes = 5}) async {
+    final now = DateTime.now().millisecondsSinceEpoch / 1000;
+    final start = now - (minutes * 60);
+    final url = '$baseUrl/api/native/clips?start=$start&end=$now';
     final resp = await _client.get(Uri.parse(url));
     if (resp.statusCode != 200) throw Exception('Failed: ${resp.statusCode}');
     final data = jsonDecode(resp.body);

@@ -16,7 +16,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
   List<Clip> _clips = [];
   bool _loading = true;
   String? _error;
-  int _windowMinutes = 60;
+  int _windowMinutes = 5;
   int _totalClips = 0;
 
   final List<int> _windowOptions = [5, 15, 30, 60, 240, 720, 1440];
@@ -228,7 +228,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                                   _ClipCard(
                                     clip: _clips[i],
                                     api: widget.api,
-                                    onTap: () => _openClip(_clips[i]),
+                                    onTap: () => _openClip(i),
                                     onDelete: () => _deleteClip(_clips[i]),
                                     formatTime: _formatTime,
                                   ),
@@ -240,11 +240,15 @@ class _ViewerScreenState extends State<ViewerScreen> {
     );
   }
 
-  void _openClip(Clip clip) {
+  void _openClip(int index) {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => ClipPlayerScreen(clip: clip, api: widget.api),
+        builder: (_) => ClipPlayerScreen(
+          clips: _clips,
+          initialIndex: index,
+          api: widget.api,
+        ),
       ),
     );
   }

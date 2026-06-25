@@ -194,6 +194,7 @@ class MainActivity : ComponentActivity() {
                     )
                     val recorder = Recorder.Builder()
                         .setQualitySelector(qualitySelector)
+                        .setTargetVideoEncodingBitRate(2_000_000) // 2 Mbps
                         .build()
                     videoCapture = VideoCapture.withOutput(recorder)
                     provider.unbindAll()

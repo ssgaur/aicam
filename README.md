@@ -53,7 +53,7 @@ ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
 
 ## Key Features
 
-- **24/7 recording** — 10s MP4 chunks, no gaps (parallel upload doesn't block recording)
+- **24/7 recording** — 10s MP4 chunks at **720p, 2 Mbps (~2.5 MB/clip, ~21 GB/day)**, no gaps (parallel upload doesn't block recording)
 - **Enterprise retry queue** — phone stores failed uploads locally, auto-retries with exponential backoff, manual retry/delete from UI
 - **Self-healing** — health check every 15s, auto-resumes on server recovery, requeues on app restart
 - **YOLOv8n detection** — person, car, truck, motorcycle, etc. at 640px (~0.08s/frame on D4s_v5)
@@ -61,6 +61,9 @@ ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
 - **24h rolling archival** — all clips + frames uploaded to Azure Blob, auto-cleaned after 24h
 - **Private blob access** — SAS token URLs for secure browser playback
 - **Web viewer** — timeline slider, 5m–24h windows, active/empty badges, delete button, AI insights
+- **Mobile viewers** — Flutter app (`AiCamViewer/`) and a native SwiftUI "Camera" tab in the
+  [Neighbourly](https://github.com/ssgaur/blf-telegram-automation) app: clip grid, pinch-zoom
+  playback, prev/next, download & share
 - **Analytics preserved** — DB records (detections, tracks, counts) kept permanently even after video expires
 
 ## Azure Infrastructure
@@ -96,13 +99,31 @@ The green chip on the top-right shows: `↑uploaded ⟳in-flight ⏳pending`
 
 On app restart, if unsent clips exist, a banner appears: **"N unsent clips — Send / Delete?"**
 
+## Mobile Viewers
+
+Two native viewers consume the read API (`/api/native/clips`, `/media/clip/...`):
+
+| Viewer | Where | Notes |
+|--------|-------|-------|
+| **AiCamViewer** (Flutter, iOS/Android) | `AiCamViewer/` in this repo | Clip grid, time-window filter (default 5m), video player with pinch-zoom + prev/next, download & share |
+| **Neighbourly "Camera" tab** (native SwiftUI, iOS) | [`ssgaur/blf-telegram-automation`](https://github.com/ssgaur/blf-telegram-automation) → `ios/Sources/Camera*.swift` | Same UX, native; lives as a tab in the BLF community app between Community and Settings |
+
+Both must handle two AiCam quirks:
+- **Self-signed cert** — use a cert-trusting HTTP client; for playback, **download the clip first** then play the local file (AVPlayer / video_player can't stream through a custom-trust client).
+- **Wrong container duration** — CameraX mp4s report a far-longer duration; use the backend's `duration_sec` and loop at the real end.
+
+Build/run AiCamViewer:
+```bash
+cd AiCamViewer && flutter pub get && flutter run        # device/simulator
+```
+
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Health check |
 | POST | `/api/native/upload` | Upload MP4 chunk (multipart) |
-| GET | `/api/native/clips?minutes=N` | List clips in time window |
+| GET | `/api/native/clips?start=<ts>&end=<ts>` | List clips in time window (epoch seconds; no `minutes` param — clients compute the window) |
 | GET | `/api/native/clips/range` | Min/max timestamps |
 | GET | `/api/native/status` | Worker status, queue depth |
 | GET | `/api/native/insights` | AI narrative + stats |
