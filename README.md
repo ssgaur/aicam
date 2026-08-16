@@ -32,12 +32,17 @@ git clone https://github.com/ssgaur/aicam.git && cd aicam
 
 ### Cloud (Azure VM)
 
+> The former personal Azure VM was intentionally torn down in August 2026 to
+> stop costs. The old IP is no longer valid. Recreate cloud infrastructure from
+> [docs/AZURE_REBUILD_AND_TEARDOWN.md](docs/AZURE_REBUILD_AND_TEARDOWN.md)
+> before using this section.
+
 ```bash
-# Deploy to Azure VM (already provisioned: 20.197.31.88)
-scp native_camera_pipeline.py backend/main.py viewer.html azureuser@20.197.31.88:~/aicam/
-ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
-# On phone: set backend URL to https://20.197.31.88:8100, tap Start
-# Viewer: https://20.197.31.88:8100/viewer
+# Replace these values with the newly created VM/domain.
+scp native_camera_pipeline.py backend/main.py viewer.html azureuser@<VM_HOST>:~/aicam/
+ssh azureuser@<VM_HOST> "sudo systemctl restart aicam"
+# On phone: set backend URL to https://<DOMAIN>, tap Start
+# Viewer: https://<DOMAIN>/viewer
 ```
 
 ## Architecture

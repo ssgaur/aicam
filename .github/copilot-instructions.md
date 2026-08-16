@@ -45,8 +45,10 @@ Phone (AiCameraX app) → FastAPI backend → YOLOv8n → Azure Blob → Viewer 
 ## Development Workflow
 
 1. **All code changes in this repo** — never edit directly on VM.
-2. **Deploy via scp**: `scp native_camera_pipeline.py backend/main.py viewer.html azureuser@20.197.31.88:~/aicam/`
-3. **Restart**: `ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"`
+2. **Deploy via scp**: use the current rebuilt VM/domain. The former personal
+   `aicam-server` deployment was torn down in August 2026; do not assume the
+   old `20.197.31.88` IP exists. See `docs/AZURE_REBUILD_AND_TEARDOWN.md`.
+3. **Restart**: `ssh azureuser@<VM_HOST> "sudo systemctl restart aicam"`
 4. **Validate Python**: `python3 -c "import ast; ast.parse(open('backend/main.py').read())"`
 5. **Validate JS**: `node -e "new Function(scriptContent)"` to catch syntax errors in viewer.
 6. **Test locally**: `./start.sh` runs the full stack on localhost:8100.
@@ -94,7 +96,12 @@ aicam/
 
 ## Azure Resources
 
-- VM: `aicam-server` (D4s_v5, 20.197.31.88, rg: BLF-ARCHIVER-RG)
-- Storage: `aicamstorage2026` (containers: clips, frames)
+The former personal deployment was intentionally deleted in August 2026 to
+stop billing. Its code remains in this repository, and its exact teardown and
+rebuild recipe is `docs/AZURE_REBUILD_AND_TEARDOWN.md`.
+
+- Former VM: `aicam-server` (D4s_v5, Central India; old IP `20.197.31.88` is released)
+- Former Storage: `aicamstorage2026` (containers: clips, frames; deleted with rolling media)
 - Postgres: `assamese-learn-db` (shared, DB: telegram_app)
-- SSH: `ssh azureuser@20.197.31.88` (key-based, IP-locked)
+- Shared resource group: `blf-archiver-rg` also hosts the **Telegram archiver**. Never delete
+  this group merely to tear down/rebuild AiCam.
