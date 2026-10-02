@@ -73,7 +73,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-private const val DEFAULT_BACKEND = "https://20.197.31.88:8100"
+private val DEFAULT_BACKEND = BuildConfig.AICAM_BACKEND_URL
 
 class MainActivity : ComponentActivity() {
     private var previewView: PreviewView? = null
@@ -500,4 +500,3 @@ class MainActivity : ComponentActivity() {
     }
 
 }
-

@@ -58,45 +58,57 @@ az resource list -g "$RG" \
 
 ## Rebuild baseline (CPU / single-camera)
 
-This recreates the old personal deployment. It is **not** the scalable
-enterprise architecture described in [ENTERPRISE_PLATFORM_RFC.md](ENTERPRISE_PLATFORM_RFC.md).
+The supported rebuild path is now the idempotent deployment script:
 
 ```bash
-RG=aicam-rg
-LOCATION=centralindia
-VM=aicam-server
-ADMIN=azureuser
-
-az group create -g "$RG" -l "$LOCATION"
-az vm create \
-  -g "$RG" -n "$VM" \
-  --image Ubuntu2204 \
-  --size Standard_D4s_v5 \
-  --admin-username "$ADMIN" \
-  --ssh-key-values "$HOME/.ssh/id_rsa.pub" \
-  --os-disk-size-gb 64 \
-  --public-ip-sku Standard
-
-# Keep SSH restricted to the operator's current public IPv4.
-MY_IP=$(curl -4 -s ifconfig.me)
-az vm open-port -g "$RG" -n "$VM" --port 22 --priority 1000 --source-address-prefixes "$MY_IP"
-
-# Temporary only: TCP 8100 was previously public. For a real rebuild, create a
-# domain, terminate real TLS with Caddy/Nginx, and require authentication.
-az vm open-port -g "$RG" -n "$VM" --port 8100 --priority 1010
-
-az storage account create \
-  -g "$RG" -n <globally-unique-storage-account-name> \
-  -l "$LOCATION" --sku Standard_LRS --kind StorageV2
-az storage container create --account-name <storage-account-name> --name clips --auth-mode login
-az storage container create --account-name <storage-account-name> --name frames --auth-mode login
+bash deploy/azure_cpu_recorder.sh
 ```
 
-Then clone `https://github.com/ssgaur/aicam`, create its Python virtual
-environment, install `requirements.txt`, configure secrets only in the VM's
-gitignored `.env`, copy the service unit, and start `aicam.service`. Consult
-`README.md`, `SETUP_FROM_SCRATCH.md`, and `.github/copilot-instructions.md`
-for the current application details.
+It creates a dedicated `aicam-rg` boundary in Central India:
+
+| Resource | Current baseline |
+|---|---|
+| VM | `aicam-recorder`, `Standard_D4s_v5`, Ubuntu 22.04 |
+| Network | Explicit VNet, NIC, NSG, and static public IP |
+| API | HTTPS on 8100 with a self-signed IP certificate |
+| Access boundary | SSH and 8100 limited to the current operator IPv4 `/32` |
+| Blob | Private `clips` and `frames` containers; no public blob access |
+| PostgreSQL | Existing `aicam` DB via a dedicated `aicam_app_user` role |
+| Retention | Blob cleaner removes rolling media older than 24 hours |
+
+The deployment intentionally installs the CPU recorder requirements, not SAM2.
+YOLO recording/upload/viewing works on D4s_v5; the experimental SAM2 deployment
+remains a separate GPU concern. Secrets are generated at deployment time and
+written only to the VM's mode-600 `backend/.env`.
+
+The camera API still has no per-camera authentication. The `/32` NSG restriction
+is therefore mandatory. Re-run the script whenever the operator's public IP
+changes; do not broaden port 8100 to the internet.
+
+Stop compute billing after a test:
+
+```bash
+az vm deallocate -g aicam-rg -n aicam-recorder
+```
+
+For a disposable test, remove the full deployment, its dedicated database role,
+and only rows above the pre-test ID baseline captured in the ignored run-state
+file:
+
+```bash
+bash deploy/destroy_cpu_recorder.sh --yes
+```
+
+The destroy script refuses any resource group except `aicam-rg`, aborts if an
+unexpected resource is found there, waits for Azure deletion to finish, verifies
+the dedicated PostgreSQL role is gone, and preserves the shared PostgreSQL
+server, `aicam` database/schema, and every row at or below the frozen baseline.
+
+Start a later clean run:
+
+```bash
+bash deploy/azure_cpu_recorder.sh
+```
 
 ## Important rebuild improvements
 
