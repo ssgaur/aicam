@@ -40,7 +40,7 @@ git clone https://github.com/ssgaur/aicam.git && cd aicam
 ```bash
 bash deploy/azure_cpu_recorder.sh
 # On phone: use the HTTPS URL printed by the script, then tap Start.
-# Re-run the script if the operator's public IP changes.
+# Never re-run over an active state/resource group; destroy and deploy cleanly.
 # After a disposable test:
 bash deploy/destroy_cpu_recorder.sh --yes
 ```
@@ -170,7 +170,9 @@ AICAM_PG_DSN=postgresql://...    # Postgres connection string
 
 All changes should be made in this repo. The CPU deployment script uploads only
 the current safe runtime files, restarts `aicam.service`, verifies HTTPS health,
-and records the pre-test database baseline used by guarded teardown.
+and records pre-test row counts plus maximum IDs before database ownership
+changes. It refuses overlapping deployments. Guarded teardown requires every
+table to return exactly to that frozen baseline.
 
 Validate before deploying:
 

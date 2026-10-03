@@ -58,7 +58,7 @@ az resource list -g "$RG" \
 
 ## Rebuild baseline (CPU / single-camera)
 
-The supported rebuild path is now the idempotent deployment script:
+The supported rebuild path is a guarded single-run deployment script:
 
 ```bash
 bash deploy/azure_cpu_recorder.sh
@@ -82,7 +82,9 @@ remains a separate GPU concern. Secrets are generated at deployment time and
 written only to the VM's mode-600 `backend/.env`.
 
 The camera API still has no per-camera authentication. The `/32` NSG restriction
-is therefore mandatory. Re-run the script whenever the operator's public IP
+is therefore mandatory. Never rerun provisioning over an active state/resource
+group because that could rotate access and compromise the frozen cleanup
+baseline. Destroy the disposable run and deploy cleanly if the operator IP
 changes; do not broaden port 8100 to the internet.
 
 Stop compute billing after a test:
@@ -92,8 +94,7 @@ az vm deallocate -g aicam-rg -n aicam-recorder
 ```
 
 For a disposable test, remove the full deployment, its dedicated database role,
-and only rows above the pre-test ID baseline captured in the ignored run-state
-file:
+and only rows above the pre-test baseline captured in the ignored run-state file:
 
 ```bash
 bash deploy/destroy_cpu_recorder.sh --yes
@@ -102,7 +103,8 @@ bash deploy/destroy_cpu_recorder.sh --yes
 The destroy script refuses any resource group except `aicam-rg`, aborts if an
 unexpected resource is found there, waits for Azure deletion to finish, verifies
 the dedicated PostgreSQL role is gone, and preserves the shared PostgreSQL
-server, `aicam` database/schema, and every row at or below the frozen baseline.
+server and `aicam` database/schema. It verifies all five native tables return to
+their exact frozen row-count and max-ID pairs before deleting the resource group.
 
 Start a later clean run:
 

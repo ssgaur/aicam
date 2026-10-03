@@ -2,7 +2,8 @@
 # Provision a bounded Central India CPU deployment for one AiCameraX recorder.
 #
 # The camera API has no application-layer authentication yet, so inbound SSH and
-# HTTPS are restricted to OPERATOR_IP/32. Re-run after the operator IP changes.
+# HTTPS are restricted to OPERATOR_IP/32. Active deployments cannot be rerun;
+# destroy and deploy cleanly after an operator IP change.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +34,7 @@ PG_SERVER="${PG_SERVER:-assamese-learn-db}"
 PG_HOST="${PG_HOST:-assamese-learn-db.postgres.database.azure.com}"
 PG_DATABASE="${PG_DATABASE:-aicam}"
 PG_ROLE="${PG_ROLE:-aicam_app_user}"
-PG_ADMIN="${PG_ADMIN:-ssgaur94_outlook.com#EXT#@ssgaur94outlook.onmicrosoft.com}"
+PG_ADMIN="${PG_ADMIN:-}"
 
 for command in az curl openssl psql scp ssh tar; do
   command -v "$command" >/dev/null || {
@@ -49,6 +50,27 @@ done
   echo "SSH private key not found: $SSH_PRIVATE_KEY" >&2
   exit 1
 }
+if [[ -z "$PG_ADMIN" ]]; then
+  PG_ADMIN="$(
+    az postgres flexible-server microsoft-entra-admin list \
+      -g "$PG_RG" -s "$PG_SERVER" \
+      --query '[0].principalName' -o tsv
+  )"
+fi
+[[ -n "$PG_ADMIN" ]] || {
+  echo "Microsoft Entra PostgreSQL administrator was not found." >&2
+  exit 1
+}
+[[ ! -e "$STATE_FILE" ]] || {
+  echo "Active or incomplete deployment state already exists: $STATE_FILE" >&2
+  echo "Run deploy/destroy_cpu_recorder.sh --yes before creating another deployment." >&2
+  exit 1
+}
+if [[ "$(az group exists -n "$RG")" == "true" ]]; then
+  echo "Dedicated resource group already exists without run state: $RG" >&2
+  echo "Inspect and clean the incomplete deployment before retrying." >&2
+  exit 1
+fi
 
 OPERATOR_IP="${OPERATOR_IP:-$(curl -4fsS https://ifconfig.me)}"
 OPERATOR_CIDR="${OPERATOR_IP%/32}/32"
@@ -123,6 +145,12 @@ az network nsg rule create \
 PUBLIC_IP="$(az network public-ip show -g "$RG" -n "$PIP" --query ipAddress -o tsv)"
 
 echo ">>> Dedicated PostgreSQL role in the existing aicam database"
+PG_VM_RULE="aicam-recorder-vm"
+az postgres flexible-server firewall-rule create \
+  -g "$PG_RG" -n "$PG_SERVER" -r "$PG_VM_RULE" \
+  --start-ip-address "$PUBLIC_IP" \
+  --end-ip-address "$PUBLIC_IP" \
+  -o none
 PG_RULE="aicam-provision-current"
 az postgres flexible-server firewall-rule create \
   -g "$PG_RG" -n "$PG_SERVER" -r "$PG_RULE" \
@@ -137,6 +165,43 @@ remove_pg_rule() {
 trap 'remove_pg_rule; cleanup' EXIT
 
 PG_TOKEN="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+BASELINE_ASSIGNMENTS="$(
+  PGPASSWORD="$PG_TOKEN" psql \
+    -h "$PG_HOST" -p 5432 -d "$PG_DATABASE" -U "$PG_ADMIN" \
+    -At -v ON_ERROR_STOP=1 <<'SQL'
+SELECT 'BASELINE_CLIP_COUNT=' || COUNT(*) FROM native_clips;
+SELECT 'BASELINE_CLIP_ID=' || COALESCE(MAX(id), 0) FROM native_clips;
+SELECT 'BASELINE_FRAME_COUNT=' || COUNT(*) FROM native_sampled_frames;
+SELECT 'BASELINE_FRAME_ID=' || COALESCE(MAX(id), 0) FROM native_sampled_frames;
+SELECT 'BASELINE_DETECTION_COUNT=' || COUNT(*) FROM native_detections;
+SELECT 'BASELINE_DETECTION_ID=' || COALESCE(MAX(id), 0) FROM native_detections;
+SELECT 'BASELINE_TRACK_COUNT=' || COUNT(*) FROM native_object_tracks;
+SELECT 'BASELINE_TRACK_ID=' || COALESCE(MAX(id), 0) FROM native_object_tracks;
+SELECT 'BASELINE_REPORT_COUNT=' || COUNT(*) FROM native_clip_reports;
+SELECT 'BASELINE_REPORT_ID=' || COALESCE(MAX(clip_id), 0) FROM native_clip_reports;
+SQL
+)"
+
+# Persist cleanup data before any database ownership or service mutation. A failed
+# standalone deployment can now run the normal guarded destroy path.
+cat >"$STATE_FILE" <<EOF
+RG=$RG
+VM=$VM
+PUBLIC_IP=$PUBLIC_IP
+STORAGE=$STORAGE
+PG_RG=$PG_RG
+PG_SERVER=$PG_SERVER
+PG_HOST=$PG_HOST
+PG_DATABASE=$PG_DATABASE
+PG_ROLE=$PG_ROLE
+PG_ADMIN=$PG_ADMIN
+PG_VM_RULE=$PG_VM_RULE
+$BASELINE_ASSIGNMENTS
+DEPLOY_STATUS=provisioning
+DEPLOY_STARTED_AT=$DEPLOY_STARTED_AT
+EOF
+chmod 600 "$STATE_FILE"
+
 PGPASSWORD="$PG_TOKEN" psql \
   -h "$PG_HOST" -p 5432 -d "$PG_DATABASE" -U "$PG_ADMIN" \
   -v ON_ERROR_STOP=1 \
@@ -286,26 +351,6 @@ echo ">>> Verifying the IP-restricted HTTPS endpoint"
 curl -kfsS "https://$PUBLIC_IP:$PORT/healthz"
 echo
 
-BASELINE_ASSIGNMENTS="$(
-  ssh "${SSH_OPTIONS[@]}" "$ADMIN@$PUBLIC_IP" 'cd "$HOME/aicam" && set -a && source backend/.env && set +a && venv/bin/python -' <<'PY'
-import os
-import psycopg
-
-tables = {
-    "BASELINE_CLIP_ID": ("native_clips", "id"),
-    "BASELINE_FRAME_ID": ("native_sampled_frames", "id"),
-    "BASELINE_DETECTION_ID": ("native_detections", "id"),
-    "BASELINE_TRACK_ID": ("native_object_tracks", "id"),
-    "BASELINE_REPORT_ID": ("native_clip_reports", "clip_id"),
-}
-with psycopg.connect(os.environ["AICAM_PG_DSN"]) as con:
-    for key, (table, column) in tables.items():
-        value = con.execute(
-            f"SELECT COALESCE(MAX({column}), 0) FROM {table}"
-        ).fetchone()[0]
-        print(f"{key}={int(value)}")
-PY
-)"
 DEPLOY_FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DEPLOY_ELAPSED_SECONDS="$(( $(date +%s) - DEPLOY_START_EPOCH ))"
 cat >"$STATE_FILE" <<EOF
@@ -319,7 +364,9 @@ PG_HOST=$PG_HOST
 PG_DATABASE=$PG_DATABASE
 PG_ROLE=$PG_ROLE
 PG_ADMIN=$PG_ADMIN
+PG_VM_RULE=$PG_VM_RULE
 $BASELINE_ASSIGNMENTS
+DEPLOY_STATUS=ready
 DEPLOY_STARTED_AT=$DEPLOY_STARTED_AT
 DEPLOY_FINISHED_AT=$DEPLOY_FINISHED_AT
 DEPLOY_ELAPSED_SECONDS=$DEPLOY_ELAPSED_SECONDS

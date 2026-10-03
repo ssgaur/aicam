@@ -26,10 +26,15 @@ source "$STATE_FILE"
 : "${PG_DATABASE:?}"
 : "${PG_ROLE:?}"
 : "${PG_ADMIN:?}"
+: "${BASELINE_CLIP_COUNT:?}"
 : "${BASELINE_CLIP_ID:?}"
+: "${BASELINE_FRAME_COUNT:?}"
 : "${BASELINE_FRAME_ID:?}"
+: "${BASELINE_DETECTION_COUNT:?}"
 : "${BASELINE_DETECTION_ID:?}"
+: "${BASELINE_TRACK_COUNT:?}"
 : "${BASELINE_TRACK_ID:?}"
+: "${BASELINE_REPORT_COUNT:?}"
 : "${BASELINE_REPORT_ID:?}"
 
 if [[ "$RG" != "aicam-rg" ]]; then
@@ -79,6 +84,9 @@ az postgres flexible-server firewall-rule create \
 az postgres flexible-server firewall-rule delete \
   -g "$PG_RG" -n "$PG_SERVER" -r neighbourly-community-aicam --yes -o none \
   >/dev/null 2>&1 || true
+az postgres flexible-server firewall-rule delete \
+  -g "$PG_RG" -n "$PG_SERVER" -r "${PG_VM_RULE:-aicam-recorder-vm}" --yes -o none \
+  >/dev/null 2>&1 || true
 
 echo ">>> Removing only rows created after the frozen pre-test baseline"
 PG_TOKEN="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
@@ -113,6 +121,43 @@ WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'app_role')
 \gexec
 SQL
 unset PG_TOKEN
+
+PG_TOKEN="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
+ACTUAL_BASELINE="$(
+  PGPASSWORD="$PG_TOKEN" psql \
+    -h "$PG_HOST" -p 5432 -d "$PG_DATABASE" -U "$PG_ADMIN" \
+    -At -v ON_ERROR_STOP=1 <<'SQL'
+SELECT 'BASELINE_CLIP_COUNT=' || COUNT(*) FROM native_clips;
+SELECT 'BASELINE_CLIP_ID=' || COALESCE(MAX(id), 0) FROM native_clips;
+SELECT 'BASELINE_FRAME_COUNT=' || COUNT(*) FROM native_sampled_frames;
+SELECT 'BASELINE_FRAME_ID=' || COALESCE(MAX(id), 0) FROM native_sampled_frames;
+SELECT 'BASELINE_DETECTION_COUNT=' || COUNT(*) FROM native_detections;
+SELECT 'BASELINE_DETECTION_ID=' || COALESCE(MAX(id), 0) FROM native_detections;
+SELECT 'BASELINE_TRACK_COUNT=' || COUNT(*) FROM native_object_tracks;
+SELECT 'BASELINE_TRACK_ID=' || COALESCE(MAX(id), 0) FROM native_object_tracks;
+SELECT 'BASELINE_REPORT_COUNT=' || COUNT(*) FROM native_clip_reports;
+SELECT 'BASELINE_REPORT_ID=' || COALESCE(MAX(clip_id), 0) FROM native_clip_reports;
+SQL
+)"
+unset PG_TOKEN
+EXPECTED_BASELINE="$(cat <<EOF
+BASELINE_CLIP_COUNT=$BASELINE_CLIP_COUNT
+BASELINE_CLIP_ID=$BASELINE_CLIP_ID
+BASELINE_FRAME_COUNT=$BASELINE_FRAME_COUNT
+BASELINE_FRAME_ID=$BASELINE_FRAME_ID
+BASELINE_DETECTION_COUNT=$BASELINE_DETECTION_COUNT
+BASELINE_DETECTION_ID=$BASELINE_DETECTION_ID
+BASELINE_TRACK_COUNT=$BASELINE_TRACK_COUNT
+BASELINE_TRACK_ID=$BASELINE_TRACK_ID
+BASELINE_REPORT_COUNT=$BASELINE_REPORT_COUNT
+BASELINE_REPORT_ID=$BASELINE_REPORT_ID
+EOF
+)"
+if [[ "$ACTUAL_BASELINE" != "$EXPECTED_BASELINE" ]]; then
+  echo "Recorder tables did not return to the frozen pre-test baseline." >&2
+  diff <(printf '%s\n' "$EXPECTED_BASELINE") <(printf '%s\n' "$ACTUAL_BASELINE") >&2 || true
+  exit 1
+fi
 
 ROLE_COUNT="$(
   PG_TOKEN="$(az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv)"
