@@ -857,7 +857,9 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
             """,
             (duration, video_fps, sample_fps, sampled_count, job.clip_id),
         )
-        maybe_quarantine_empty_clip(con, job.clip_id, job.local_path, job.frames_dir)
+        cloud_mode = os.environ.get("AICAM_CLOUD") == "1"
+        if not cloud_mode:
+            maybe_quarantine_empty_clip(con, job.clip_id, job.local_path, job.frames_dir)
         con.commit()
         try:
             import postgres_store
@@ -867,7 +869,7 @@ def process_clip(job: ClipJob, model: YOLO, device: str, tracker: GlobalTracker,
             print(f"[postgres-sync] clip_id={job.clip_id} error={pg_exc}")
 
         # Cloud mode: upload ALL clips to Azure Blob, then delete locally
-        if os.environ.get("AICAM_CLOUD") == "1":
+        if cloud_mode:
             try:
                 clip_url, frame_urls = _upload_to_blob(job.local_path, job.frames_dir)
                 con.execute("UPDATE clips SET blob_url=? WHERE id=?", (clip_url, job.clip_id))

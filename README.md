@@ -38,11 +38,11 @@ git clone https://github.com/ssgaur/aicam.git && cd aicam
 > before using this section.
 
 ```bash
-# Replace these values with the newly created VM/domain.
-scp native_camera_pipeline.py backend/main.py viewer.html azureuser@<VM_HOST>:~/aicam/
-ssh azureuser@<VM_HOST> "sudo systemctl restart aicam"
-# On phone: set backend URL to https://<DOMAIN>, tap Start
-# Viewer: https://<DOMAIN>/viewer
+bash deploy/azure_cpu_recorder.sh
+# On phone: use the HTTPS URL printed by the script, then tap Start.
+# Never re-run over an active state/resource group; destroy and deploy cleanly.
+# After a disposable test:
+bash deploy/destroy_cpu_recorder.sh --yes
 ```
 
 ## Architecture
@@ -94,9 +94,12 @@ The Android app lives in `AiCameraX/`. Key files:
 
 ```bash
 cd AiCameraX
-./gradlew assembleDebug
+./gradlew assembleDebug -PaicamBackendUrl=https://<CURRENT_VM_IP>:8100
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+The committed fallback is `https://127.0.0.1:8100`; transient cloud IPs are
+injected at build time and are never left as stale source defaults.
 
 ### UI Status Chip
 
@@ -148,7 +151,7 @@ data/native_camera/
 └── frames/              # Temporary JPEG frames (deleted after blob upload)
 ```
 
-**Blob containers** (`aicamstorage2026`):
+**Blob containers** (the account name is printed by the deployment script):
 - `clips/` — MP4 video files
 - `frames/` — JPEG sampled frames
 
@@ -158,20 +161,23 @@ Environment variables (`.env` on VM):
 
 ```
 AICAM_CLOUD=1                    # Enable blob upload + local cleanup
-AZURE_STORAGE_ACCOUNT=aicamstorage2026
+AZURE_STORAGE_ACCOUNT=<dedicated-aicam-account>
 AZURE_STORAGE_KEY=<key>
 AICAM_PG_DSN=postgresql://...    # Postgres connection string
 ```
 
 ## Development
 
-All changes should be made in this repo and deployed via `scp`:
+All changes should be made in this repo. The CPU deployment script uploads only
+the current safe runtime files, restarts `aicam.service`, verifies HTTPS health,
+and records pre-test row counts plus maximum IDs before database ownership
+changes. It refuses overlapping deployments. Guarded teardown requires every
+table to return exactly to that frozen baseline. Teardown deallocates the VM
+before database deletion so recorder workers cannot race or deadlock cleanup.
 
-```bash
-# Edit locally → deploy → restart
-scp native_camera_pipeline.py backend/main.py viewer.html azureuser@20.197.31.88:~/aicam/
-ssh azureuser@20.197.31.88 "sudo systemctl restart aicam"
-```
+AiCameraX allows 45 seconds for network/TLS connection establishment while
+retaining the on-disk retry queue. This is important on weak community Wi-Fi;
+queued MP4s survive app restarts and endpoint rotation.
 
 Validate before deploying:
 
