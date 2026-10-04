@@ -172,7 +172,12 @@ All changes should be made in this repo. The CPU deployment script uploads only
 the current safe runtime files, restarts `aicam.service`, verifies HTTPS health,
 and records pre-test row counts plus maximum IDs before database ownership
 changes. It refuses overlapping deployments. Guarded teardown requires every
-table to return exactly to that frozen baseline.
+table to return exactly to that frozen baseline. Teardown deallocates the VM
+before database deletion so recorder workers cannot race or deadlock cleanup.
+
+AiCameraX allows 45 seconds for network/TLS connection establishment while
+retaining the on-disk retry queue. This is important on weak community Wi-Fi;
+queued MP4s survive app restarts and endpoint rotation.
 
 Validate before deploying:
 

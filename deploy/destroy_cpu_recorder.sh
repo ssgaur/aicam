@@ -65,6 +65,11 @@ if az group exists -n "$RG" | grep -qx true; then
   )
 fi
 
+echo ">>> Deallocating recorder VM to stop all database writers"
+if az vm show -g "$RG" -n "$VM" -o none >/dev/null 2>&1; then
+  az vm deallocate -g "$RG" -n "$VM" -o none
+fi
+
 OPERATOR_IP="${OPERATOR_IP:-$(curl -4fsS https://ifconfig.me)}"
 PG_RULE="aicam-destroy-current"
 remove_pg_rule() {

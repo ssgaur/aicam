@@ -81,7 +81,7 @@ class MainActivity : ComponentActivity() {
     private var recording: Recording? = null
     private var chunkJob: Job? = null
     private val http = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(3, TimeUnit.MINUTES)
         .readTimeout(3, TimeUnit.MINUTES)
         .apply {

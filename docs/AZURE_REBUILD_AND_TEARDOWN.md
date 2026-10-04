@@ -105,6 +105,7 @@ unexpected resource is found there, waits for Azure deletion to finish, verifies
 the dedicated PostgreSQL role is gone, and preserves the shared PostgreSQL
 server and `aicam` database/schema. It verifies all five native tables return to
 their exact frozen row-count and max-ID pairs before deleting the resource group.
+The VM is deallocated before row deletion to stop every database writer first.
 
 Start a later clean run:
 
