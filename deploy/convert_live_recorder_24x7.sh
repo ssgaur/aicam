@@ -53,6 +53,10 @@ SSH_OPTIONS=(
   -o ConnectTimeout=15
   -o StrictHostKeyChecking=accept-new
 )
+RECORDER_CURL_ARGS=(-fsS --max-time 10)
+if [[ -n "${AICAM_DEVICE_TOKEN_STATE:-}" ]]; then
+  RECORDER_CURL_ARGS+=(-H "X-AiCam-Token: $AICAM_DEVICE_TOKEN_STATE")
+fi
 
 echo ">>> Installing sparse-ingest and retention policy before resizing"
 scp "${SSH_OPTIONS[@]}" \
@@ -112,7 +116,7 @@ fi
 
 echo ">>> Waiting for the complete stack after VM restart"
 for _ in $(seq 1 90); do
-  if curl -fsS --max-time 10 \
+  if curl "${RECORDER_CURL_ARGS[@]}" \
       "https://recorder-${PUBLIC_IP//./-}.sslip.io/healthz" >/dev/null &&
      curl -fsS --max-time 10 \
       "https://neighbourly-${PUBLIC_IP//./-}.sslip.io/healthz" >/dev/null; then
@@ -121,7 +125,8 @@ for _ in $(seq 1 90); do
   sleep 5
 done
 HEALTH="$(
-  curl -fsS "https://recorder-${PUBLIC_IP//./-}.sslip.io/healthz"
+  curl "${RECORDER_CURL_ARGS[@]}" \
+    "https://recorder-${PUBLIC_IP//./-}.sslip.io/healthz"
 )"
 python3 - "$HEALTH" "$RETENTION_DAYS" "$MIN_CAPTURE_INTERVAL_SECONDS" <<'PY'
 import json
