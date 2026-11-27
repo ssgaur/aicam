@@ -6,6 +6,7 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.aicam-run-state.env}"
+LONG_LIVED_STATE_FILE="${LONG_LIVED_STATE_FILE:-$SCRIPT_DIR/.aicam-24x7-run-state.env}"
 SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-$HOME/.ssh/id_ed25519}"
 TARGET_SIZES="${TARGET_SIZES:-Standard_B2als_v2 Standard_B2as_v2 Standard_B2s}"
 RETENTION_DAYS="${RETENTION_DAYS:-31}"
@@ -152,9 +153,15 @@ AICAM_MIN_CAPTURE_INTERVAL_SECONDS=$MIN_CAPTURE_INTERVAL_SECONDS
 LONG_LIVED_CONFIGURED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 chmod 600 "$STATE_FILE"
+if [[ "$LONG_LIVED_STATE_FILE" != "$STATE_FILE" ]]; then
+  mv "$STATE_FILE" "$LONG_LIVED_STATE_FILE"
+  chmod 600 "$LONG_LIVED_STATE_FILE"
+  STATE_FILE="$LONG_LIVED_STATE_FILE"
+fi
 
 echo "24x7 recorder conversion passed."
 echo "  VM size:            $SELECTED_SIZE"
 echo "  Blob retention:     $RETENTION_DAYS days"
 echo "  Accepted frequency: one clip per $MIN_CAPTURE_INTERVAL_SECONDS seconds/device"
 echo "  Static public IP:   $PUBLIC_IP"
+echo "  Protected state:    $STATE_FILE"

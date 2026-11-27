@@ -17,6 +17,7 @@ AiCameraX/.kotlin/
 AiCameraX/build/
 AiCameraX/local.properties
 deploy/.aicam-run-state.env
+deploy/.aicam-24x7-run-state.env
 
 # Flutter viewer app build artifacts
 AiCamViewer/.dart_tool/

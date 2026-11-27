@@ -93,6 +93,10 @@ clips received inside the per-device admission interval. The Android sparse
 recorder remains the primary policy; this server gate protects the budget from
 stale continuously recording clients.
 
+On success, the converter moves the ignored runtime baseline to
+`deploy/.aicam-24x7-run-state.env`. This intentionally causes older disposable
+teardown entry points to fail closed because their expected state file is absent.
+
 The deployment intentionally installs the CPU recorder requirements, not SAM2.
 YOLO recording/upload/viewing works on D4s_v5; the experimental SAM2 deployment
 remains a separate GPU concern. Secrets are generated at deployment time and

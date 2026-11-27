@@ -58,6 +58,9 @@ for 31 days, accepts at most one clip per device every ten minutes, and selects
 the first available low-cost 4+ GB x86 burstable size (`B2als_v2`, `B2as_v2`,
 then `B2s`). Long-lived state is protected from ordinary teardown; destructive
 cleanup additionally requires `--purge-recordings`.
+The conversion moves its protected baseline to
+`deploy/.aicam-24x7-run-state.env`, so older disposable teardown scripts cannot
+mistake the long-lived deployment for a test run.
 
 ## Architecture
 
