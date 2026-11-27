@@ -62,6 +62,20 @@ The conversion moves its protected baseline to
 `deploy/.aicam-24x7-run-state.env`, so older disposable teardown scripts cannot
 mistake the long-lived deployment for a test run.
 
+Protect the public recorder hostname before installing the unattended APK:
+
+```bash
+bash deploy/configure_24x7_device_auth.sh
+source deploy/.aicam-24x7-run-state.env
+cd AiCameraX
+./gradlew :app:assembleDebug \
+  -PaicamBackendUrl="https://recorder-${PUBLIC_IP//./-}.sslip.io" \
+  -PaicamDeviceToken="$AICAM_DEVICE_TOKEN_STATE"
+```
+
+The current operator public IP remains temporarily allowed so an older installed
+build keeps uploading until the token-injected APK replaces it.
+
 ## Architecture
 
 | Component | Description |

@@ -23,7 +23,12 @@ android {
             .getOrElse("https://127.0.0.1:8100")
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
+        val deviceToken = providers.gradleProperty("aicamDeviceToken")
+            .getOrElse("")
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
         buildConfigField("String", "AICAM_BACKEND_URL", "\"$backendUrl\"")
+        buildConfigField("String", "AICAM_DEVICE_TOKEN", "\"$deviceToken\"")
     }
 
     buildTypes {

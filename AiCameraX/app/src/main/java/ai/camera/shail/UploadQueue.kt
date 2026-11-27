@@ -35,6 +35,7 @@ class UploadQueue(
     private val context: Context,
     private val http: OkHttpClient,
     private val getBackendUrl: () -> String,
+    private val getDeviceToken: () -> String,
     private val getSampleFps: () -> Double,
     private val getChunkSeconds: () -> Double,
 ) {
@@ -47,6 +48,7 @@ class UploadQueue(
         private const val HEALTH_CHECK_INTERVAL_MS = 15_000L
         private const val PREFS_NAME = "aicam_upload_queue"
         private const val CHUNKS_DIRECTORY = "aicam_chunks"
+        private const val DEVICE_TOKEN_HEADER = "X-AiCam-Token"
         private const val LEGACY_DEFAULT_DURATION_SECONDS = 10.0
         private val NEW_CLIP_PATTERN = Regex("""clip_(\d+)_(\d+)_(\d+)\.mp4""")
         private val LEGACY_CLIP_PATTERN = Regex("""chunk_(\d+)_(\d+)\.mp4""")
@@ -333,7 +335,11 @@ class UploadQueue(
     private suspend fun checkServerHealth(): Boolean = withContext(Dispatchers.IO) {
         try {
             val url = "${getBackendUrl().trimEnd('/')}/healthz"
-            val req = Request.Builder().url(url).get().build()
+            val request = Request.Builder().url(url).get()
+            getDeviceToken().takeIf { it.isNotBlank() }?.let {
+                request.header(DEVICE_TOKEN_HEADER, it)
+            }
+            val req = request.build()
             http.newCall(req).execute().use { it.isSuccessful }
         } catch (_: IOException) {
             false
@@ -359,10 +365,13 @@ class UploadQueue(
             .addFormDataPart("file", entry.file.name, entry.file.asRequestBody("video/mp4".toMediaType()))
             .build()
 
-        val req = Request.Builder()
+        val request = Request.Builder()
             .url("$backendUrl/api/native/upload")
             .post(body)
-            .build()
+        getDeviceToken().takeIf { it.isNotBlank() }?.let {
+            request.header(DEVICE_TOKEN_HEADER, it)
+        }
+        val req = request.build()
 
         http.newCall(req).execute().use { response ->
             when {
@@ -445,4 +454,5 @@ class UploadQueue(
             .putInt("failed_total", failedCount.get())
             .apply()
     }
+
 }

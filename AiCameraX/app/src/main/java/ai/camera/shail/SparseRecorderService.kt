@@ -93,6 +93,7 @@ class SparseRecorderService : LifecycleService() {
             context = this,
             http = NetworkClientFactory.create(),
             getBackendUrl = { BuildConfig.AICAM_BACKEND_URL },
+            getDeviceToken = { BuildConfig.AICAM_DEVICE_TOKEN },
             getSampleFps = { preferences.sampleFps() },
             getChunkSeconds = { preferences.policy().durationSeconds.toDouble() },
         )

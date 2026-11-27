@@ -428,10 +428,13 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             backendOk = withContext(Dispatchers.IO) {
                 try {
-                    val request = Request.Builder()
+                    val requestBuilder = Request.Builder()
                         .url("${BuildConfig.AICAM_BACKEND_URL.trimEnd('/')}/healthz")
                         .get()
-                        .build()
+                    BuildConfig.AICAM_DEVICE_TOKEN.takeIf { it.isNotBlank() }?.let {
+                        requestBuilder.header(DEVICE_TOKEN_HEADER, it)
+                    }
+                    val request = requestBuilder.build()
                     http.newCall(request).execute().use { it.isSuccessful }
                 } catch (_: IOException) {
                     false
@@ -451,4 +454,8 @@ class MainActivity : ComponentActivity() {
 
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    private companion object {
+        const val DEVICE_TOKEN_HEADER = "X-AiCam-Token"
+    }
 }
