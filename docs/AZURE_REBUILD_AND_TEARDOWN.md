@@ -83,7 +83,7 @@ instead of creating another resource group:
 STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
   RETENTION_DAYS=31 \
   MIN_CAPTURE_INTERVAL_SECONDS=600 \
-  TARGET_SIZE=Standard_B2s \
+  TARGET_SIZES="Standard_B2als_v2 Standard_B2as_v2 Standard_B2s" \
   bash deploy/convert_live_recorder_24x7.sh
 ```
 

@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.aicam-run-state.env}"
 SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-$HOME/.ssh/id_ed25519}"
-TARGET_SIZE="${TARGET_SIZE:-Standard_B2s}"
+TARGET_SIZES="${TARGET_SIZES:-Standard_B2als_v2 Standard_B2as_v2 Standard_B2s}"
 RETENTION_DAYS="${RETENTION_DAYS:-31}"
 MIN_CAPTURE_INTERVAL_SECONDS="${MIN_CAPTURE_INTERVAL_SECONDS:-600}"
 ADMIN="${ADMIN:-azureuser}"
@@ -88,11 +88,20 @@ REMOTE
 CURRENT_SIZE="$(
   az vm show -g "$RG" -n "$VM" --query hardwareProfile.vmSize -o tsv
 )"
-if [[ "$CURRENT_SIZE" != "$TARGET_SIZE" ]]; then
-  echo ">>> Resizing $VM from $CURRENT_SIZE to $TARGET_SIZE"
+SELECTED_SIZE="$CURRENT_SIZE"
+if [[ " $TARGET_SIZES " != *" $CURRENT_SIZE "* ]]; then
+  echo ">>> Resizing $VM from $CURRENT_SIZE using candidates: $TARGET_SIZES"
   az vm deallocate -g "$RG" -n "$VM" -o none
-  if ! az vm resize -g "$RG" -n "$VM" --size "$TARGET_SIZE" -o none; then
-    echo "Target size unavailable; restoring $CURRENT_SIZE." >&2
+  SELECTED_SIZE=""
+  for candidate in $TARGET_SIZES; do
+    if az vm resize -g "$RG" -n "$VM" --size "$candidate" -o none; then
+      SELECTED_SIZE="$candidate"
+      break
+    fi
+    echo "Capacity unavailable for $candidate; trying the next candidate." >&2
+  done
+  if [[ -z "$SELECTED_SIZE" ]]; then
+    echo "All target sizes were unavailable; restoring $CURRENT_SIZE." >&2
     az vm resize -g "$RG" -n "$VM" --size "$CURRENT_SIZE" -o none || true
     az vm start -g "$RG" -n "$VM" -o none || true
     exit 1
@@ -137,7 +146,7 @@ SERVICES="$(
 
 cat >>"$STATE_FILE" <<EOF
 LONG_LIVED_MODE=1
-VM_SIZE=$TARGET_SIZE
+VM_SIZE=$SELECTED_SIZE
 AICAM_BLOB_RETENTION_DAYS=$RETENTION_DAYS
 AICAM_MIN_CAPTURE_INTERVAL_SECONDS=$MIN_CAPTURE_INTERVAL_SECONDS
 LONG_LIVED_CONFIGURED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -145,7 +154,7 @@ EOF
 chmod 600 "$STATE_FILE"
 
 echo "24x7 recorder conversion passed."
-echo "  VM size:            $TARGET_SIZE"
+echo "  VM size:            $SELECTED_SIZE"
 echo "  Blob retention:     $RETENTION_DAYS days"
 echo "  Accepted frequency: one clip per $MIN_CAPTURE_INTERVAL_SECONDS seconds/device"
 echo "  Static public IP:   $PUBLIC_IP"
