@@ -2,6 +2,8 @@ package ai.camera.shail
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Log
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
@@ -11,15 +13,17 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import java.io.File
+import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Enterprise-grade upload queue for AiCam.
+ * Disk-backed upload queue for AiCam.
  *
- * - Files on disk ARE the queue (cache/aicam_chunks/[all].mp4)
+ * - Files on disk ARE the queue (files/aicam_chunks/[all].mp4)
  * - Parallel upload workers (configurable concurrency)
  * - Exponential backoff on failures
  * - Auto-drain when server is reachable
@@ -42,6 +46,10 @@ class UploadQueue(
         private const val MAX_BACKOFF_MS = 60_000L
         private const val HEALTH_CHECK_INTERVAL_MS = 15_000L
         private const val PREFS_NAME = "aicam_upload_queue"
+        private const val CHUNKS_DIRECTORY = "aicam_chunks"
+        private const val LEGACY_DEFAULT_DURATION_SECONDS = 10.0
+        private val NEW_CLIP_PATTERN = Regex("""clip_(\d+)_(\d+)_(\d+)\.mp4""")
+        private val LEGACY_CLIP_PATTERN = Regex("""chunk_(\d+)_(\d+)\.mp4""")
     }
 
     // --- State ---
@@ -61,7 +69,7 @@ class UploadQueue(
     // Control flags
     private val queueActive = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
-    private val serverReachable = AtomicBoolean(true)
+    private val serverReachable = AtomicBoolean(false)
 
     private var drainJob: Job? = null
     private var healthJob: Job? = null
@@ -72,7 +80,8 @@ class UploadQueue(
     data class ChunkEntry(
         val file: File,
         val chunkIndex: Int,
-        val recordedAtMs: Long = System.currentTimeMillis(),
+        val startedAtMs: Long,
+        val durationSeconds: Double,
     )
 
     // --- Public API ---
@@ -86,7 +95,7 @@ class UploadQueue(
         uploadedCount.set(prefs.getInt("uploaded_total", 0))
         failedCount.set(prefs.getInt("failed_total", 0))
 
-        // Scan disk for existing chunks (from previous sessions)
+        migrateLegacyChunks()
         scanDiskForPending()
 
         // Start drain workers
@@ -97,18 +106,29 @@ class UploadQueue(
         Log.i(TAG, "Queue started. Pending: ${pendingCount.get()}, Uploaded: ${uploadedCount.get()}")
     }
 
-    /** Stop the queue (graceful — in-flight uploads finish). */
+    /** Stop workers. Files remain on disk and are restored by the next service process. */
     fun stop() {
         queueActive.set(false)
         drainJob?.cancel()
         healthJob?.cancel()
+        scope.cancel()
         persistCounters()
         Log.i(TAG, "Queue stopped.")
     }
 
     /** Enqueue a new chunk for upload. Called by the recording loop. */
-    fun enqueue(file: File, chunkIndex: Int) {
-        val entry = ChunkEntry(file = file, chunkIndex = chunkIndex)
+    fun enqueue(
+        file: File,
+        chunkIndex: Int,
+        startedAtMs: Long,
+        durationSeconds: Int,
+    ) {
+        val entry = ChunkEntry(
+            file = file,
+            chunkIndex = chunkIndex,
+            startedAtMs = startedAtMs,
+            durationSeconds = durationSeconds.toDouble(),
+        )
         pending.offer(entry)
         pendingCount.incrementAndGet()
         Log.d(TAG, "Enqueued chunk #$chunkIndex: ${file.name}")
@@ -169,13 +189,16 @@ class UploadQueue(
             if (p > 0) append(" ⏳$p")
             if (e > 0) append(" ⚠$e")
             if (dead > 0) append(" ✗$dead")
+            if (!hasValidatedWifi()) append(" · Wi-Fi required")
+            else if (!serverReachable.get()) append(" · backend waiting")
         }
     }
 
     // --- Internal ---
 
-    private fun chunksDir(): File = File(context.cacheDir, "aicam_chunks").apply { mkdirs() }
+    private fun chunksDir(): File = File(context.filesDir, CHUNKS_DIRECTORY).apply { mkdirs() }
 
+    @Synchronized
     private fun scanDiskForPending() {
         val dir = chunksDir()
         val existing = dir.listFiles()?.filter { it.extension == "mp4" } ?: emptyList()
@@ -185,9 +208,7 @@ class UploadQueue(
         var added = 0
         existing.sortedBy { it.lastModified() }.forEach { file ->
             if (file.name !in alreadyQueued) {
-                // Parse index from filename: chunk_<timestamp>_<index>.mp4
-                val idx = file.nameWithoutExtension.substringAfterLast('_').toIntOrNull() ?: 0
-                pending.offer(ChunkEntry(file = file, chunkIndex = idx, recordedAtMs = file.lastModified()))
+                pending.offer(parseEntry(file))
                 added++
             }
         }
@@ -200,6 +221,11 @@ class UploadQueue(
         drainJob = scope.launch {
             while (queueActive.get()) {
                 if (isPaused.get() || !serverReachable.get()) {
+                    delay(2000)
+                    continue
+                }
+                if (!hasValidatedWifi()) {
+                    serverReachable.set(false)
                     delay(2000)
                     continue
                 }
@@ -239,8 +265,11 @@ class UploadQueue(
                         // Re-queue on cancellation
                         pending.offer(entry)
                         pendingCount.incrementAndGet()
-                    } catch (e: Exception) {
+                    } catch (e: IOException) {
                         Log.e(TAG, "Upload exception: ${entry.file.name}", e)
+                        handleUploadFailure(entry)
+                    } catch (e: IllegalArgumentException) {
+                        Log.e(TAG, "Invalid upload request: ${entry.file.name}", e)
                         handleUploadFailure(entry)
                     } finally {
                         inFlight.remove(entry.file.name)
@@ -283,7 +312,11 @@ class UploadQueue(
         healthJob?.cancel()
         healthJob = scope.launch {
             while (queueActive.get()) {
-                delay(HEALTH_CHECK_INTERVAL_MS)
+                if (!hasValidatedWifi()) {
+                    serverReachable.set(false)
+                    delay(2_000L)
+                    continue
+                }
                 val reachable = checkServerHealth()
                 val wasDown = !serverReachable.getAndSet(reachable)
                 if (reachable && wasDown) {
@@ -292,6 +325,7 @@ class UploadQueue(
                     retryCount.clear()
                     scanDiskForPending()
                 }
+                delay(HEALTH_CHECK_INTERVAL_MS)
             }
         }
     }
@@ -301,7 +335,9 @@ class UploadQueue(
             val url = "${getBackendUrl().trimEnd('/')}/healthz"
             val req = Request.Builder().url(url).get().build()
             http.newCall(req).execute().use { it.isSuccessful }
-        } catch (_: Exception) {
+        } catch (_: IOException) {
+            false
+        } catch (_: IllegalArgumentException) {
             false
         }
     }
@@ -309,15 +345,13 @@ class UploadQueue(
     private suspend fun doUpload(entry: ChunkEntry): Boolean = withContext(Dispatchers.IO) {
         val backendUrl = getBackendUrl().trimEnd('/')
         val sampleFps = getSampleFps()
-        val chunkSeconds = getChunkSeconds()
-
-        val now = entry.recordedAtMs / 1000.0
-        val startTs = now - chunkSeconds
+        val startTs = entry.startedAtMs / 1000.0
+        val endTs = startTs + entry.durationSeconds
 
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("start_ts", "%.3f".format(startTs))
-            .addFormDataPart("end_ts", "%.3f".format(now))
+            .addFormDataPart("start_ts", String.format(Locale.US, "%.3f", startTs))
+            .addFormDataPart("end_ts", String.format(Locale.US, "%.3f", endTs))
             .addFormDataPart("sample_fps", sampleFps.toString())
             .addFormDataPart("conf", "0.35")
             .addFormDataPart("chunk_index", entry.chunkIndex.toString())
@@ -334,14 +368,75 @@ class UploadQueue(
             when {
                 response.isSuccessful -> true
                 response.code in 400..499 -> {
-                    // Client error — file is probably corrupt, don't retry forever
                     Log.w(TAG, "Server rejected ${entry.file.name}: HTTP ${response.code}")
-                    // Count as one retry attempt so it eventually dies
-                    true // treat as "uploaded" to avoid infinite loop on corrupt files
+                    false
                 }
                 else -> false // 5xx = server error, retry
             }
         }
+    }
+
+    private fun hasValidatedWifi(): Boolean {
+        val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return UploadNetworkPolicy.allowsUpload(
+            hasInternetCapability = capabilities.hasCapability(
+                NetworkCapabilities.NET_CAPABILITY_INTERNET,
+            ),
+            isValidated = capabilities.hasCapability(
+                NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+            ),
+            isWifiTransport = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+        )
+    }
+
+    private fun parseEntry(file: File): ChunkEntry {
+        NEW_CLIP_PATTERN.matchEntire(file.name)?.let { match ->
+            return ChunkEntry(
+                file = file,
+                startedAtMs = match.groupValues[1].toLong(),
+                durationSeconds = match.groupValues[2].toDouble(),
+                chunkIndex = match.groupValues[3].toInt(),
+            )
+        }
+        LEGACY_CLIP_PATTERN.matchEntire(file.name)?.let { match ->
+            return ChunkEntry(
+                file = file,
+                startedAtMs = file.lastModified() -
+                    (LEGACY_DEFAULT_DURATION_SECONDS * 1_000L).toLong(),
+                durationSeconds = LEGACY_DEFAULT_DURATION_SECONDS,
+                chunkIndex = match.groupValues[2].toInt(),
+            )
+        }
+        val fallbackDuration = getChunkSeconds().coerceAtLeast(1.0)
+        return ChunkEntry(
+            file = file,
+            startedAtMs = file.lastModified() - (fallbackDuration * 1_000L).toLong(),
+            durationSeconds = fallbackDuration,
+            chunkIndex = 0,
+        )
+    }
+
+    private fun migrateLegacyChunks() {
+        val legacyDirectory = File(context.cacheDir, CHUNKS_DIRECTORY)
+        val durableDirectory = chunksDir()
+        legacyDirectory.listFiles()
+            ?.filter { it.extension == "mp4" }
+            ?.forEach { source ->
+                val destination = File(durableDirectory, source.name)
+                if (destination.exists()) return@forEach
+                try {
+                    if (!source.renameTo(destination)) {
+                        source.copyTo(destination)
+                        if (!source.delete()) {
+                            Log.w(TAG, "Could not remove migrated cache clip ${source.name}")
+                        }
+                    }
+                } catch (error: IOException) {
+                    Log.e(TAG, "Could not migrate cached clip ${source.name}", error)
+                }
+            }
     }
 
     private fun persistCounters() {
