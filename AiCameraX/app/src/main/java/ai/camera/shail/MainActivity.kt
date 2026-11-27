@@ -16,8 +16,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -249,10 +247,8 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Chip(BuildConfig.AICAM_BACKEND_URL)
@@ -262,7 +258,45 @@ class MainActivity : ComponentActivity() {
                 ) {
                     Text(if (backendOk == true) "✓ Backend" else "Test backend", fontSize = 11.sp)
                 }
-                Text("Every", color = Color.White, fontSize = 12.sp)
+                Spacer(modifier = Modifier.weight(1f))
+                Button(
+                    onClick = { serviceBinder?.retryUploads() },
+                    enabled = isServiceBound,
+                    contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
+                ) {
+                    Text("Retry queue", fontSize = 11.sp)
+                }
+                Button(
+                    modifier = Modifier
+                        .width(142.dp)
+                        .height(52.dp),
+                    onClick = {
+                        if (snapshot.serviceRunning) stopRecorder() else prepareStart()
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (snapshot.serviceRunning) {
+                            Color(0xFFC62828)
+                        } else {
+                            Color(0xFF2E7D32)
+                        },
+                    ),
+                ) {
+                    Text(
+                        when {
+                            snapshot.serviceRunning -> "Stop recorder"
+                            snapshot.enabled -> "Resume recorder"
+                            else -> "Start recorder"
+                        },
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("Record every", color = Color.White, fontSize = 12.sp)
                 RecorderPolicy.INTERVAL_PRESETS.forEach { minutes ->
                     Button(
                         onClick = { intervalMinutes = minutes },
@@ -281,48 +315,21 @@ class MainActivity : ComponentActivity() {
                 }
                 SmallTextField(
                     value = durationText,
-                    label = "10-60 sec",
-                    width = 92,
+                    label = "Clip seconds",
+                    width = 120,
                     enabled = !snapshot.serviceRunning,
                     keyboardType = KeyboardType.Number,
                     onValueChange = { durationText = it.filter(Char::isDigit).take(2) },
                 )
                 SmallTextField(
                     value = sampleFpsText,
-                    label = "FPS",
-                    width = 70,
+                    label = "Sample FPS",
+                    width = 100,
                     enabled = !snapshot.serviceRunning,
                     keyboardType = KeyboardType.Decimal,
                     onValueChange = { sampleFpsText = it.take(4) },
                 )
-                Button(
-                    onClick = { serviceBinder?.retryUploads() },
-                    enabled = isServiceBound,
-                    contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
-                ) {
-                    Text("Retry queue", fontSize = 11.sp)
-                }
-                Button(
-                    onClick = {
-                        if (snapshot.serviceRunning) stopRecorder() else prepareStart()
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (snapshot.serviceRunning) {
-                            Color(0xFFC62828)
-                        } else {
-                            Color(0xFF2E7D32)
-                        },
-                    ),
-                ) {
-                    Text(
-                        when {
-                            snapshot.serviceRunning -> "Stop"
-                            snapshot.enabled -> "Resume"
-                            else -> "Start"
-                        },
-                        fontSize = 13.sp,
-                    )
-                }
+                Spacer(modifier = Modifier.weight(1f))
                 if (snapshot.enabled && !snapshot.serviceRunning) {
                     Button(
                         onClick = { stopRecorder() },
