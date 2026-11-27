@@ -20,6 +20,8 @@ ADMIN="${ADMIN:-azureuser}"
 SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-$HOME/.ssh/id_ed25519.pub}"
 SSH_PRIVATE_KEY="${SSH_PRIVATE_KEY:-${SSH_PUBLIC_KEY%.pub}}"
 PORT="${PORT:-8100}"
+AICAM_BLOB_RETENTION_DAYS="${AICAM_BLOB_RETENTION_DAYS:-1}"
+AICAM_MIN_CAPTURE_INTERVAL_SECONDS="${AICAM_MIN_CAPTURE_INTERVAL_SECONDS:-0}"
 
 VNET="${VNET:-aicam-vnet}"
 SUBNET="${SUBNET:-aicam-subnet}"
@@ -35,6 +37,23 @@ PG_HOST="${PG_HOST:-assamese-learn-db.postgres.database.azure.com}"
 PG_DATABASE="${PG_DATABASE:-aicam}"
 PG_ROLE="${PG_ROLE:-aicam_app_user}"
 PG_ADMIN="${PG_ADMIN:-}"
+
+[[ "$AICAM_BLOB_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "AICAM_BLOB_RETENTION_DAYS must be a positive integer." >&2
+  exit 2
+}
+((AICAM_BLOB_RETENTION_DAYS <= 365)) || {
+  echo "AICAM_BLOB_RETENTION_DAYS must not exceed 365." >&2
+  exit 2
+}
+[[ "$AICAM_MIN_CAPTURE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || {
+  echo "AICAM_MIN_CAPTURE_INTERVAL_SECONDS must be a non-negative integer." >&2
+  exit 2
+}
+((AICAM_MIN_CAPTURE_INTERVAL_SECONDS <= 86400)) || {
+  echo "AICAM_MIN_CAPTURE_INTERVAL_SECONDS must not exceed 86400." >&2
+  exit 2
+}
 
 for command in az curl openssl psql scp ssh tar; do
   command -v "$command" >/dev/null || {
@@ -199,6 +218,8 @@ PG_VM_RULE=$PG_VM_RULE
 $BASELINE_ASSIGNMENTS
 DEPLOY_STATUS=provisioning
 DEPLOY_STARTED_AT=$DEPLOY_STARTED_AT
+AICAM_BLOB_RETENTION_DAYS=$AICAM_BLOB_RETENTION_DAYS
+AICAM_MIN_CAPTURE_INTERVAL_SECONDS=$AICAM_MIN_CAPTURE_INTERVAL_SECONDS
 EOF
 chmod 600 "$STATE_FILE"
 
@@ -237,6 +258,9 @@ az postgres flexible-server firewall-rule delete \
 
 cat >"$ENV_FILE" <<EOF
 AICAM_CLOUD=1
+AICAM_NATIVE_ONLY=0
+AICAM_BLOB_RETENTION_DAYS=$AICAM_BLOB_RETENTION_DAYS
+AICAM_MIN_CAPTURE_INTERVAL_SECONDS=$AICAM_MIN_CAPTURE_INTERVAL_SECONDS
 AZURE_STORAGE_ACCOUNT=$STORAGE
 AZURE_STORAGE_KEY=$STORAGE_KEY
 AZURE_STORAGE_CLIPS_CONTAINER=clips
@@ -320,6 +344,7 @@ REMOTE
 echo ">>> Uploading current safe runtime source and private environment"
 tar -C "$REPO_ROOT" -czf - \
   backend/main.py \
+  backend/runtime_policy.py \
   native_camera_pipeline.py \
   postgres_store.py \
   viewer.html \
@@ -370,6 +395,8 @@ DEPLOY_STATUS=ready
 DEPLOY_STARTED_AT=$DEPLOY_STARTED_AT
 DEPLOY_FINISHED_AT=$DEPLOY_FINISHED_AT
 DEPLOY_ELAPSED_SECONDS=$DEPLOY_ELAPSED_SECONDS
+AICAM_BLOB_RETENTION_DAYS=$AICAM_BLOB_RETENTION_DAYS
+AICAM_MIN_CAPTURE_INTERVAL_SECONDS=$AICAM_MIN_CAPTURE_INTERVAL_SECONDS
 EOF
 chmod 600 "$STATE_FILE"
 

@@ -6,9 +6,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="${STATE_FILE:-$SCRIPT_DIR/.aicam-run-state.env}"
 START_EPOCH="$(date +%s)"
 
+PURGE_RECORDINGS=0
 if [[ "${1:-}" != "--yes" ]]; then
   echo "Refusing destructive cleanup without --yes." >&2
-  echo "Usage: $0 --yes" >&2
+  echo "Usage: $0 --yes [--purge-recordings]" >&2
+  exit 2
+fi
+shift
+if [[ "${1:-}" == "--purge-recordings" && $# -eq 1 ]]; then
+  PURGE_RECORDINGS=1
+elif (($#)); then
+  echo "Usage: $0 --yes [--purge-recordings]" >&2
   exit 2
 fi
 [[ -f "$STATE_FILE" ]] || {
@@ -17,6 +25,12 @@ fi
 }
 # shellcheck disable=SC1090
 source "$STATE_FILE"
+
+if [[ "${LONG_LIVED_MODE:-0}" == "1" && "$PURGE_RECORDINGS" != "1" ]]; then
+  echo "Refusing to purge a long-lived recorder without --purge-recordings." >&2
+  echo "This guard protects its database rows and 31-day footage." >&2
+  exit 2
+fi
 
 : "${RG:?}"
 : "${VM:?}"
