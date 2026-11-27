@@ -34,6 +34,7 @@ SNAPS.mkdir(parents=True, exist_ok=True)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 import native_camera_pipeline as native_cam  # noqa: E402
+from runtime_policy import capture_is_due, parse_int_setting  # noqa: E402
 
 CAPTION_EVERY_SEC = 3.0  # ~$2-3/day at 1 FPS, well under $10
 SAM_MAX_SIDE = 320
@@ -44,6 +45,21 @@ TRACK_TTL_SEC = float(os.getenv("TRACK_TTL_SEC", "12.0"))
 TRACK_IOU_MIN = float(os.getenv("TRACK_IOU_MIN", "0.12"))
 TRACK_CENTER_MAX_PX = float(os.getenv("TRACK_CENTER_MAX_PX", "140"))
 TRACK_MOVE_PX = float(os.getenv("TRACK_MOVE_PX", "45"))
+MIN_CAPTURE_INTERVAL_SECONDS = parse_int_setting(
+    os.getenv("AICAM_MIN_CAPTURE_INTERVAL_SECONDS"),
+    name="AICAM_MIN_CAPTURE_INTERVAL_SECONDS",
+    default=0,
+    minimum=0,
+    maximum=86_400,
+)
+BLOB_RETENTION_DAYS = parse_int_setting(
+    os.getenv("AICAM_BLOB_RETENTION_DAYS"),
+    name="AICAM_BLOB_RETENTION_DAYS",
+    default=1,
+    minimum=1,
+    maximum=365,
+)
+NATIVE_ONLY_MODE = os.getenv("AICAM_NATIVE_ONLY", "0") == "1"
 
 TRACKED_CLASSES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "cat",
@@ -66,6 +82,8 @@ _state = {"sam": None, "yolo": None, "device": None,
 
 _native_upload_queue: "queue.Queue[dict | None]" = queue.Queue()
 _native_upload_worker: threading.Thread | None = None
+_native_admission_lock = threading.Lock()
+_native_last_accepted_ts: dict[str, float] = {}
 
 # 1x1 transparent PNG for "no overlay" replies to phone
 _EMPTY_PNG = (
@@ -229,18 +247,21 @@ def _ensure_native_upload_worker():
 async def lifespan(_app: FastAPI):
     _init_db()
     _load_active_tracks()
-    _load_models()
+    if NATIVE_ONLY_MODE:
+        print("[startup] Native-only mode enabled; interactive SAM/YOLO models are lazy.")
+    else:
+        _load_models()
     native_cam.init_db()
     # Re-queue clips interrupted by a previous shutdown (status='pulled' = uploaded but not processed)
     _requeue_unprocessed_clips()
-    # Start blob cleaner (deletes blobs older than 24h)
+    # Start blob cleaner for the configured rolling-retention window.
     if os.environ.get("AICAM_CLOUD") == "1":
         _start_blob_cleaner()
     yield
 
 
 def _start_blob_cleaner():
-    """Background thread: every hour, delete blobs older than 24h from Azure Storage."""
+    """Delete Blob footage older than the configured rolling-retention window."""
     def _cleaner_loop():
         import datetime as _dt
         while True:
@@ -255,7 +276,9 @@ def _start_blob_cleaner():
                     account_url=f"https://{account}.blob.core.windows.net",
                     credential=key,
                 )
-                cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=24)
+                cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+                    days=BLOB_RETENTION_DAYS
+                )
                 deleted = 0
                 for container_name in ["clips", "frames"]:
                     container = svc.get_container_client(container_name)
@@ -264,13 +287,19 @@ def _start_blob_cleaner():
                             container.delete_blob(blob.name)
                             deleted += 1
                 if deleted:
-                    print(f"[blob-cleaner] Deleted {deleted} blobs older than 24h")
+                    print(
+                        "[blob-cleaner] Deleted "
+                        f"{deleted} blobs older than {BLOB_RETENTION_DAYS} day(s)"
+                    )
             except Exception as e:
                 print(f"[blob-cleaner] Error: {e}")
 
     t = threading.Thread(target=_cleaner_loop, daemon=True, name="blob-cleaner")
     t.start()
-    print("[startup] Blob cleaner started (deletes >24h old blobs every hour)")
+    print(
+        "[startup] Blob cleaner started "
+        f"(deletes >{BLOB_RETENTION_DAYS} day(s) old blobs every hour)"
+    )
 
 
 def _requeue_unprocessed_clips():
@@ -674,7 +703,17 @@ def healthz():
         con.close()
     except Exception:
         pass
-    return {"ok": True, "device": _state.get("device"), "frames": n_frames, "latest": last}
+    return {
+        "ok": True,
+        "device": _state.get("device"),
+        "frames": n_frames,
+        "latest": last,
+        "policy": {
+            "minimum_capture_interval_seconds": MIN_CAPTURE_INTERVAL_SECONDS,
+            "blob_retention_days": BLOB_RETENTION_DAYS,
+            "native_only": NATIVE_ONLY_MODE,
+        },
+    }
 
 
 def _parse_since(s: str) -> float:
@@ -712,6 +751,32 @@ async def api_native_upload(
     native_cam.init_db()
     if end_ts <= start_ts:
         return JSONResponse({"ok": False, "error": "end_ts must be greater than start_ts"}, status_code=400)
+
+    admission_ts = time.time()
+    skipped_until: float | None = None
+    with _native_admission_lock:
+        last_accepted_ts = _native_last_accepted_ts.get(device_id)
+        if not capture_is_due(
+            last_accepted_ts,
+            admission_ts,
+            MIN_CAPTURE_INTERVAL_SECONDS,
+        ):
+            skipped_until = last_accepted_ts + MIN_CAPTURE_INTERVAL_SECONDS
+        else:
+            _native_last_accepted_ts[device_id] = admission_ts
+
+    if skipped_until is not None:
+        await file.close()
+        return {
+            "ok": True,
+            "accepted": False,
+            "skipped": True,
+            "reason": "sampling_interval",
+            "chunk_index": chunk_index,
+            "minimum_interval_seconds": MIN_CAPTURE_INTERVAL_SECONDS,
+            "next_eligible_ts": skipped_until,
+        }
+
     clip_id, local_path, frames_dir = native_cam.create_clip(start_ts, end_ts)
     local_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -721,6 +786,9 @@ async def api_native_upload(
         await file.close()
 
     if not native_cam.local_video_ok(local_path):
+        with _native_admission_lock:
+            if _native_last_accepted_ts.get(device_id) == admission_ts:
+                _native_last_accepted_ts.pop(device_id, None)
         native_cam.mark_clip_error(clip_id, "uploaded MP4 is not playable")
         return JSONResponse(
             {"ok": False, "clip_id": clip_id, "error": "uploaded MP4 is not playable", "local_path": str(local_path)},

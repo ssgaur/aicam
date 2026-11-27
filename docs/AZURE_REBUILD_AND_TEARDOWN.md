@@ -76,6 +76,23 @@ It creates a dedicated `aicam-rg` boundary in Central India:
 | PostgreSQL | Existing `aicam` DB via a dedicated `aicam_app_user` role |
 | Retention | Blob cleaner removes rolling media older than 24 hours |
 
+For the explicitly authorized 31-day deployment, convert the verified live VM
+instead of creating another resource group:
+
+```bash
+STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
+  RETENTION_DAYS=31 \
+  MIN_CAPTURE_INTERVAL_SECONDS=600 \
+  TARGET_SIZE=Standard_B2s \
+  bash deploy/convert_live_recorder_24x7.sh
+```
+
+The conversion preserves the static public IP and trusted domains while
+lowering compute cost. The backend acknowledges but does not store or process
+clips received inside the per-device admission interval. The Android sparse
+recorder remains the primary policy; this server gate protects the budget from
+stale continuously recording clients.
+
 The deployment intentionally installs the CPU recorder requirements, not SAM2.
 YOLO recording/upload/viewing works on D4s_v5; the experimental SAM2 deployment
 remains a separate GPU concern. Secrets are generated at deployment time and

@@ -45,6 +45,20 @@ bash deploy/azure_cpu_recorder.sh
 bash deploy/destroy_cpu_recorder.sh --yes
 ```
 
+For the explicitly authorized 31-day deployment, convert the verified live VM
+in place:
+
+```bash
+STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
+  bash deploy/convert_live_recorder_24x7.sh
+```
+
+This preserves its static IP and trusted HTTPS names, retains private footage
+for 31 days, accepts at most one clip per device every ten minutes, and resizes
+compute from `Standard_D4s_v5` to `Standard_B2s`. Long-lived state is protected
+from ordinary teardown; destructive cleanup additionally requires
+`--purge-recordings`.
+
 ## Architecture
 
 | Component | Description |
