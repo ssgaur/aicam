@@ -54,7 +54,8 @@ STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
 ```
 
 This preserves its static IP and trusted HTTPS names, retains private footage
-for 31 days, accepts at most one clip per device every ten minutes, and selects
+for 31 days, applies a nine-minute server safety gate around the ten-minute
+phone schedule, and selects
 the first available low-cost 4+ GB x86 burstable size (`B2als_v2`, `B2as_v2`,
 then `B2s`). Long-lived state is protected from ordinary teardown; destructive
 cleanup additionally requires `--purge-recordings`.

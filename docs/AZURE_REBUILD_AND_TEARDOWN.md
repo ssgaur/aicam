@@ -82,7 +82,7 @@ instead of creating another resource group:
 ```bash
 STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
   RETENTION_DAYS=31 \
-  MIN_CAPTURE_INTERVAL_SECONDS=600 \
+MIN_CAPTURE_INTERVAL_SECONDS=540 \
   TARGET_SIZES="Standard_B2als_v2 Standard_B2as_v2 Standard_B2s" \
   bash deploy/convert_live_recorder_24x7.sh
 ```
@@ -90,8 +90,9 @@ STATE_FILE=/path/to/live/deploy/.aicam-run-state.env \
 The conversion preserves the static public IP and trusted domains while
 lowering compute cost. The backend acknowledges but does not store or process
 clips received inside the per-device admission interval. The Android sparse
-recorder remains the primary policy; this server gate protects the budget from
-stale continuously recording clients.
+recorder remains the primary ten-minute policy; the nine-minute server gate
+tolerates upload jitter while protecting the budget from stale continuously
+recording clients.
 
 On success, the converter moves the ignored runtime baseline to
 `deploy/.aicam-24x7-run-state.env`. This intentionally causes older disposable
